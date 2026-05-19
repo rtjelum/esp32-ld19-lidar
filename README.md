@@ -22,6 +22,12 @@ This project implements a portable LiDAR scanner and visualization tool using a 
 ![Internal View](IMG_3438.jpeg)
 *Internal layout and component fitting.*
 
+![Component Placement](IMG_3439.jpg)
+*LiDAR and T-Display seated in the bottom enclosure.*
+
+![Wiring Detail](IMG_3440.JPG)
+*Detail of the wiring connection between the MCU and the sensor.*
+
 ## Software Setup
 
 ### Firmware
