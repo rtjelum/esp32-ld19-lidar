@@ -388,20 +388,24 @@ void handleSetup() {
 body{font-family:sans-serif;background:#050510;color:#fff;padding:20px;text-align:center}
 input{width:100%;max-width:300px;padding:10px;margin:10px 0;border-radius:5px;border:none}
 button{background:#7c6fff;color:#fff;padding:10px 20px;border:none;border-radius:5px;cursor:pointer}
-</style></head><body><h1>WiFi Setup</h1><div id='l'>Scanning...</div>
-<div id='f' style='display:none'>
+.net{cursor:pointer;padding:8px;border-bottom:1px solid #222}
+</style></head><body><h1>WiFi Setup</h1>
+<div id='f'>
 <input id='s' placeholder='SSID'><br><input id='p' type='password' placeholder='Password'><br>
 <button onclick='c()'>Connect</button></div>
+<div id='l' style='margin-top:20px'>Scanning for networks...</div>
 <script>
 function c(){
   fetch('/wifi/connect?ssid='+encodeURIComponent(document.getElementById('s').value)+'&pass='+encodeURIComponent(document.getElementById('p').value))
   .then(()=>alert('Rebooting...'));
 }
 fetch('/wifi/scan').then(r=>r.json()).then(d=>{
-  let h='<h3>Networks:</h3>';
-  d.forEach(n=>h+='<div onclick="document.getElementById(\\'s\\').value=\\''+n.ssid+'\\'">'+n.ssid+' ('+n.rssi+'dBm)</div>');
+  if(!d.length){document.getElementById('l').innerHTML='No networks found.';return;}
+  let h='<h3>Available Networks:</h3>';
+  d.forEach(n=>h+='<div class="net" onclick="document.getElementById(\'s\').value=\''+n.ssid+'\'">'+n.ssid+' ('+n.rssi+'dBm)</div>');
   document.getElementById('l').innerHTML=h;
-  document.getElementById('f').style.display='block';
+}).catch(e=>{
+  document.getElementById('l').innerHTML='Scan failed. Please enter details manually.';
 });
 </script></body></html>)rawhtml");
 }
@@ -988,7 +992,7 @@ load(0);
 
 void startAPMode() {
   apMode = true;
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP("battle-setup");
   server.on("/",          handleSetup);
   server.on("/wifi/scan",    handleWifiScan);
@@ -1139,4 +1143,28 @@ void setup() {
   xTaskCreate(displayTask, "disp", 4096, NULL, 1, NULL);
 }
 
-void loop() { delay(1000); }
+void loop() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "clear") {
+      Serial.println("[cmd] Clearing WiFi settings...");
+      prefs.begin("wifi", false);
+      prefs.clear();
+      prefs.end();
+      WiFi.disconnect(true, true);
+      Serial.println("[cmd] Done. Restarting...");
+      delay(500);
+      ESP.restart();
+    } else if (cmd == "reboot") {
+      Serial.println("[cmd] Restarting...");
+      delay(500);
+      ESP.restart();
+    } else if (cmd == "help") {
+      Serial.println("Available commands:");
+      Serial.println("  clear  - Wipe WiFi credentials and reboot to AP mode");
+      Serial.println("  reboot - Restart the ESP32");
+    }
+  }
+  delay(100);
+}
