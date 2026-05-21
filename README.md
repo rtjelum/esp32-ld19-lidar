@@ -59,7 +59,8 @@ This will produce `lidar_tdisplay_box_bottom.stl` and `lidar_tdisplay_box_top.st
 
 ## File Structure
 
-- `tdisps3_proj.ino`: Main Arduino firmware.
+- `esp32-ld19-lidar.ino`: Main Arduino firmware.
+- `lidar_page.h`, `sokoban_page.h`, `setup_page.h`, `sokoban_levels.h`: Web-page HTML and Sokoban level data, included by the sketch.
 - `build_box.py`: Python script to generate the 3D enclosure.
 - `makefile`: Build system for the firmware.
 - `*.stl`: Generated 3D models for printing.

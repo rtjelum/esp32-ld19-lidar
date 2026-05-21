@@ -1,25 +1,20 @@
 FQBN       = esp32:esp32:esp32s3:FlashMode=qio,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc
 PORT       = /dev/cu.usbmodem*
 BUILD_DIR  = build
-SKETCH     = tdisps3_proj.ino
-SKETCH_DIR = $(BUILD_DIR)/sketch/tdisps3_proj
+SKETCH     = esp32-ld19-lidar.ino
 ESPTOOL    = $(HOME)/Library/Arduino15/packages/esp32/tools/esptool_py/4.5.1/esptool
 
-.PHONY: all compile flash verify bootloader clean list sketchdir
+.PHONY: all compile flash verify bootloader clean list
 
 all: compile flash
 
-# arduino-cli requires the .ino filename to match the parent directory name,
-# so we stage the sketch in a correctly-named subdir under the build tree.
-sketchdir:
-	@mkdir -p $(SKETCH_DIR)
-	@ln -sf $(CURDIR)/$(SKETCH) $(SKETCH_DIR)/tdisps3_proj.ino
-
-compile: sketchdir
-	arduino-cli compile --fqbn $(FQBN) --build-path $(BUILD_DIR) $(SKETCH_DIR)
+# The sketch is named after its parent folder (esp32-ld19-lidar), so arduino-cli
+# can build it in place — no need to stage a scratch sketch directory.
+compile:
+	arduino-cli compile --fqbn $(FQBN) --build-path $(BUILD_DIR) $(CURDIR)
 
 flash: compile
-	arduino-cli upload -p $(PORT) --fqbn $(FQBN) --verify --build-path $(BUILD_DIR) $(SKETCH_DIR)
+	arduino-cli upload -p $(PORT) --fqbn $(FQBN) --verify --build-path $(BUILD_DIR) $(CURDIR)
 
 verify:
 	$(ESPTOOL) --port $(PORT) --baud 921600 verify-flash \
