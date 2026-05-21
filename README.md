@@ -2,7 +2,8 @@
 
 This project implements a portable LiDAR scanner and visualization tool using a **LilyGo T-Display-S3** (ESP32-S3 with AMOLED display) and an **LD19 LiDAR** sensor.
 
-![Project Overview](IMG_3437.jpeg)
+<img src="IMG_3437.jpeg" alt="Project Overview" width="450">
+
 *The assembled LiDAR scanner in its custom enclosure.*
 
 ## Features
@@ -19,13 +20,16 @@ This project implements a portable LiDAR scanner and visualization tool using a 
 - **LiDAR:** LD19 LiDAR Sensor
 - **Enclosure:** Custom 3D-printed case (see `build_box.py`)
 
-![Internal View](IMG_3438.jpeg)
+<img src="IMG_3438.jpeg" alt="Internal View" width="350">
+
 *Internal layout and component fitting.*
 
-![Component Placement](IMG_3439.jpg)
+<img src="IMG_3439.jpg" alt="Component Placement" width="350">
+
 *LiDAR and T-Display seated in the bottom enclosure.*
 
-![Wiring Detail](IMG_3440.JPG)
+<img src="IMG_3440.JPG" alt="Wiring Detail" width="350">
+
 *Detail of the wiring connection between the MCU and the sensor.*
 
 ## Software Setup
@@ -61,7 +65,8 @@ To re-do setup later, open a serial console at 115200 baud and type one of:
 
 The device serves a built-in Sokoban game at **http://battle.local/sokoban** (or `/sokoban` on whichever IP is shown on the display).
 
-![Sokoban running in a browser](IMG_3441.jpg)
+<img src="IMG_3441.jpg" alt="Sokoban running in a browser" width="250">
+
 *Sokoban running on the embedded web server, rendered isometrically.*
 
 Push the green crates onto the pink goal pads. Each pad must hold one crate to clear the level — there are 50 levels in total, advancing automatically when the last crate is placed. Crates can only be pushed (never pulled) and only when the square behind them is empty, so plan ahead.
