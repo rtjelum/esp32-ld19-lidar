@@ -99,10 +99,11 @@ static portMUX_TYPE lidarMux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE personMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t personLastSeen = 0;
 static volatile uint8_t  personCount = 0;
-static float personAngle[4]; // degrees, 0°=left, 90°=front, 180°=right
-static float personDist[4];  // meters
-static float personX[4];     // meters, +right
-static float personY[4];     // meters, +forward
+static const uint8_t PERSON_MAX = 6;
+static float personAngle[PERSON_MAX]; // degrees, 0°=left, 90°=front, 180°=right
+static float personDist[PERSON_MAX];  // meters
+static float personX[PERSON_MAX];     // meters, +right
+static float personY[PERSON_MAX];     // meters, +forward
 static float bgDist[360];    // mm, per-bin rolling background for shadow detection
 static volatile float lidarAreaM2 = 0.0f; // scanned polygon area in m²
 
@@ -150,10 +151,10 @@ void updateDisplay() {
     return;
   }
 
-  uint32_t pLast; uint8_t pCnt; float pAng[4], pDst[4];
+  uint32_t pLast; uint8_t pCnt; float pAng[PERSON_MAX], pDst[PERSON_MAX];
   portENTER_CRITICAL(&personMux);
   pLast = personLastSeen; pCnt = personCount;
-  for (uint8_t i = 0; i < pCnt && i < 4; i++) { pAng[i] = personAngle[i]; pDst[i] = personDist[i]; }
+  for (uint8_t i = 0; i < pCnt && i < PERSON_MAX; i++) { pAng[i] = personAngle[i]; pDst[i] = personDist[i]; }
   portEXIT_CRITICAL(&personMux);
 
   if (pCnt > 0 && (millis() - pLast) < 1500) {
@@ -317,26 +318,46 @@ void personTask(void *pv) {
     if (areaSum_mm2 < 0) areaSum_mm2 = -areaSum_mm2;
     lidarAreaM2 = areaSum_mm2 / 1.0e6f;
 
-    const int GAP_TOL = 2;
+    // Raw-candidate filters. Tightened to suppress false positives:
+    //   - bgDist - cur > 400 mm: shadow must be clearly in front of background, not edge noise.
+    //   - nds >= 4 valid bin samples: a real torso projects ≥4 LiDAR points; isolated spikes don't.
+    //   - density >= 0.6: most bins inside the shadow span must carry a valid return,
+    //     so half-empty smears (reflective floors, partial occlusions) get rejected.
+    //   - pw in [300, 1200] mm: human shoulder/torso range.
+    const float PERSON_MIN_WIDTH_MM = 300.0f;
+    const float PERSON_MAX_WIDTH_MM = 1200.0f;
+    const float BG_DELTA_MM         = 400.0f;
+    const int   MIN_SAMPLES         = 4;
+    const float MIN_DENSITY         = 0.6f;
+    const int   MAX_CANDIDATES      = 12;
+    const int   GAP_TOL = 2;
     int start = -1, gap = 0;
-    uint8_t cnt = 0;
-    float pa[4], pd[4], px[4], py[4];
+    uint8_t ncand = 0;
+    float cpa[MAX_CANDIDATES], cpd[MAX_CANDIDATES], cpx[MAX_CANDIDATES], cpy[MAX_CANDIDATES], cpw[MAX_CANDIDATES];
     for (int i = 0; i <= 180; i++) {
       int b = i < 180 ? (180 + i) % 360 : -1;
-      bool on = b >= 0 && cur[b] > 0 && bgDist[b] > 400.0f && bgDist[b] - cur[b] > 300.0f;
+      bool on = b >= 0 && cur[b] > 0 && bgDist[b] > 400.0f && bgDist[b] - cur[b] > BG_DELTA_MM;
+      // A bin with a valid return at ~background distance is a ray pass-through:
+      // the LiDAR's ray went past — there is no blocking object at this angle.
+      // We must NOT count those bins as part of a person's shadow. The previous
+      // logic tolerated them under GAP_TOL, which let a gap between two adjacent
+      // people merge into one fake "wide" shadow. We now end the span the moment
+      // we hit such a bin. Only cur==0 (no return) bins remain tolerated by GAP_TOL.
+      bool passThrough = b >= 0 && cur[b] > 0 && bgDist[b] > 400.0f && bgDist[b] - cur[b] <= BG_DELTA_MM;
       if (on) { if (start < 0) start = i; gap = 0; }
       else if (start >= 0) {
         gap++;
-        if (gap > GAP_TOL || i == 180) {
+        if (gap > GAP_TOL || i == 180 || passThrough) {
           int lastShadow = i - gap;
           int len = lastShadow - start + 1;
-          if (len >= 2 && len <= 60 && cnt < 4) {
+          if (len >= 2 && len <= 60 && ncand < MAX_CANDIDATES) {
             float ds[60]; int nds = 0;
             for (int k = start; k <= lastShadow && nds < 60; k++) {
               int bk = (180 + k) % 360;
               if (cur[bk] > 0) ds[nds++] = cur[bk];
             }
-            if (nds >= 2) {
+            float density = (float)nds / (float)len;
+            if (nds >= MIN_SAMPLES && density >= MIN_DENSITY) {
               for (int a = 1; a < nds; a++) { // insertion sort, nds ≤ 60
                 float v = ds[a]; int q = a - 1;
                 while (q >= 0 && ds[q] > v) { ds[q+1] = ds[q]; q--; }
@@ -344,22 +365,40 @@ void personTask(void *pv) {
               }
               float md = ds[nds/2];
               float pw = 2.0f * md * sinf((float)len * PI / 360.0f);
-              if (pw >= 100.0f && pw <= 1200.0f) {
+              if (pw >= PERSON_MIN_WIDTH_MM && pw <= PERSON_MAX_WIDTH_MM) {
                 int midBin = (180 + (start + lastShadow) / 2) % 360;
                 float rotDeg = (float)midBin - 270.0f; // -90..+89 (front semicircle)
                 float rad    = rotDeg * PI / 180.0f;
                 float xm     = -sinf(rad) * md / 1000.0f;
                 float ym     =  cosf(rad) * md / 1000.0f;
-                px[cnt] = xm; py[cnt] = ym;
-                pa[cnt] = atan2f(xm, ym) * 180.0f / PI + 90.0f;
-                pd[cnt] = md / 1000.0f;
-                cnt++;
+                cpx[ncand] = xm; cpy[ncand] = ym;
+                cpa[ncand] = atan2f(xm, ym) * 180.0f / PI + 90.0f;
+                cpd[ncand] = md / 1000.0f;
+                cpw[ncand] = pw;
+                ncand++;
               }
             }
           }
           start = -1; gap = 0;
         }
       }
+    }
+
+    // Sort raw candidates by shadow width, biggest first, and take top PERSON_MAX.
+    // No temporal persistence: a clear shadow appears the same frame the person is seen.
+    for (int a = 1; a < ncand; a++) {
+      float wv = cpw[a], av = cpa[a], dv = cpd[a], xv = cpx[a], yv = cpy[a];
+      int q = a - 1;
+      while (q >= 0 && cpw[q] < wv) {
+        cpw[q+1] = cpw[q]; cpa[q+1] = cpa[q]; cpd[q+1] = cpd[q]; cpx[q+1] = cpx[q]; cpy[q+1] = cpy[q];
+        q--;
+      }
+      cpw[q+1] = wv; cpa[q+1] = av; cpd[q+1] = dv; cpx[q+1] = xv; cpy[q+1] = yv;
+    }
+    uint8_t cnt = ncand > PERSON_MAX ? PERSON_MAX : ncand;
+    float pa[PERSON_MAX], pd[PERSON_MAX], px[PERSON_MAX], py[PERSON_MAX];
+    for (uint8_t i = 0; i < cnt; i++) {
+      pa[i] = cpa[i]; pd[i] = cpd[i]; px[i] = cpx[i]; py[i] = cpy[i];
     }
 
     portENTER_CRITICAL(&personMux);
@@ -471,7 +510,7 @@ void handleLidarScan() {
   j += "]";
 
   // attach current detections so the browser can render smileys without re-doing detection
-  uint8_t pCnt; float pA[4], pD[4], pX[4], pY[4];
+  uint8_t pCnt; float pA[PERSON_MAX], pD[PERSON_MAX], pX[PERSON_MAX], pY[PERSON_MAX];
   portENTER_CRITICAL(&personMux);
   pCnt = personCount;
   for (uint8_t i = 0; i < pCnt; i++) { pA[i]=personAngle[i]; pD[i]=personDist[i]; pX[i]=personX[i]; pY[i]=personY[i]; }
@@ -555,6 +594,7 @@ a{color:#7cf0ff;font-size:.8rem}
   <button id='pplBtn' class='on'>People</button>
   <button id='raw'>Raw</button>
   <button id='hold'>Hold</button>
+  <button id='mirror'>Mirror</button>
 </div>
 <div id='ppllist'>People detection off</div>
 <a href='/sokoban'>Sokoban &rarr;</a>
@@ -566,7 +606,7 @@ var paused=false,rawOn=false,frames=0,lastFps=performance.now();
 var WX0=-4,WX1=4,WY0=0,WY1=5;
 var prevX=new Float32Array(360),prevY=new Float32Array(360),prevTime=new Float64Array(360);
 var prevSeen=new Uint8Array(360),speedBins=new Float32Array(360);
-var personsOn=true,lastPersons=[];
+var personsOn=true,lastPersons=[],mirror=false;
 var SENSOR_ROT_DEG=270; // physical front sits at sensor angle 270°
 var WALL_CSS=70;   // wall extrusion height in CSS px
 var WALL_PX=WALL_CSS*dpr;
@@ -589,6 +629,9 @@ document.getElementById('raw').onclick=function(){
 };
 document.getElementById('pplBtn').onclick=function(){
   personsOn=!personsOn;this.classList.toggle('on',personsOn);
+};
+document.getElementById('mirror').onclick=function(){
+  mirror=!mirror;this.classList.toggle('on',mirror);
 };
 function w2x(x){return (x-WX0)/(WX1-WX0)*c.width;}
 function w2y(y){return WALL_PX + (y-WY0)/(WY1-WY0)*(c.height-WALL_PX);}
@@ -637,6 +680,7 @@ function draw(d){
     var ang=bin*Math.PI/180;
     var wx=-Math.sin(ang)*dmm/1000;
     var wy= Math.cos(ang)*dmm/1000;
+    if(mirror)wx=-wx;
     var xmm=wx*1000,ymm=wy*1000;
     if(prevSeen[bin]){
       var dxw=xmm-prevX[bin], dyw=ymm-prevY[bin];
@@ -668,7 +712,7 @@ function draw(d){
       ctx.fillStyle='hsla('+hue+',90%,55%,0.95)';
       ctx.beginPath();ctx.arc(px,py,(2+2*t)*dpr,0,Math.PI*2);ctx.fill();
     }
-    if(personsOn)for(var pi=0;pi<lastPersons.length;pi++){var p=lastPersons[pi];drawSmiley(w2x(p.x),w2y(p.y),14*dpr);}
+    if(personsOn)for(var pi=0;pi<lastPersons.length;pi++){var p=lastPersons[pi];drawSmiley(w2x(mirror?-p.x:p.x),w2y(p.y),14*dpr);}
     document.getElementById('np').innerText=pp.length;
     document.getElementById('rpm').innerText=d.rpm;
     return;
@@ -708,7 +752,7 @@ function draw(d){
   ctx.fillStyle='#7cf0ff';
   ctx.beginPath();ctx.arc(w2x(0),w2y(0),5*dpr,0,Math.PI*2);ctx.fill();
 
-  if(personsOn)for(var pi=0;pi<lastPersons.length;pi++){var p=lastPersons[pi];var prad=Math.max(12,28-22*p.d/4)*dpr;drawSmiley(w2x(p.x),w2y(p.y)-WALL_PX*1.3,prad);}
+  if(personsOn)for(var pi=0;pi<lastPersons.length;pi++){var p=lastPersons[pi];var prad=Math.max(12,28-22*p.d/4)*dpr;drawSmiley(w2x(mirror?-p.x:p.x),w2y(p.y)-WALL_PX*1.3,prad);}
   document.getElementById('np').innerText=pp.length;
   document.getElementById('rpm').innerText=d.rpm;
 }
@@ -742,11 +786,30 @@ canvas{background:#1b0d2e;border:2px solid #ffd54f;border-radius:12px;box-shadow
 .pb{width:60px;height:60px;background:rgba(255,213,79,.15);border:1px solid rgba(255,213,79,.4);border-radius:10px;color:#ffe082;display:flex;align-items:center;justify-content:center;font-size:24px;user-select:none;-webkit-tap-highlight-color:transparent}
 .pb:active{background:rgba(255,167,38,.5);color:#fff}
 @media (hover:hover) and (pointer:fine){.pad,#btnRst,#btnReset{display:none!important}}
-</style></head><body>
+body.trk-on .pad{display:none!important}
+body:not(.trk-on) #trkGrid,body:not(.trk-on) #trkStatus{display:none}
+#trkBar{display:flex;flex-direction:column;align-items:center;gap:4px;margin-top:6px}
+#trkStatus{font-size:.8rem;color:#cfe1ff;font-family:monospace}
+#trkGrid{display:grid;grid-template-columns:repeat(3,70px);grid-template-rows:repeat(3,70px);gap:6px;position:relative}
+.tc{width:70px;height:70px;background:rgba(255,213,79,.08);border:1px solid rgba(255,213,79,.2);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:30px;color:#ffe082}
+.tc.b{visibility:hidden}
+.tc.active{background:rgba(255,213,79,.78);color:#3e2723;border-color:#ffd54f}
+#trkDot{position:absolute;width:18px;height:18px;border-radius:50%;background:#7cf0ff;border:2px solid #fff;box-shadow:0 0 10px #7cf0ff;pointer-events:none;display:none;transform:translate(-50%,-50%);z-index:2}
+</style></head><body class='trk-on'>
 <h1>SOKOBAN</h1><div id='st'>Moves: 0</div><canvas id='g' width='320' height='240'></canvas>
 <div class='pad'>
 <div></div><div class='pb' onclick='mvK(0,-1)'>&uarr;</div><div></div>
 <div class='pb' onclick='mvK(-1,0)'>&larr;</div><div class='pb' onclick='mvK(0,1)'>&darr;</div><div class='pb' onclick='mvK(1,0)'>&rarr;</div>
+</div>
+<div id='trkBar'>
+  <button class='btn s' id='trkBtn' style='max-width:220px;padding:6px 10px;margin-top:0' onclick='trkToggle()'>Tracker: ON</button>
+  <div id='trkGrid'>
+    <div class='tc b'></div><div class='tc' data-cell='up'>&uarr;</div><div class='tc b'></div>
+    <div class='tc' data-cell='left'>&larr;</div><div class='tc' data-cell='idle'>&middot;</div><div class='tc' data-cell='right'>&rarr;</div>
+    <div class='tc b'></div><div class='tc' data-cell='down'>&darr;</div><div class='tc b'></div>
+    <div id='trkDot'></div>
+  </div>
+  <div id='trkStatus'>none</div>
 </div>
 <button class='btn' id='btnRst' onclick='reset()'>Restart Level</button>
 <button class='btn s' onclick='location.href="/"'>Back to Menu</button>
@@ -983,6 +1046,83 @@ window.onkeydown=e=>{
   if(dx||dy)mvK(dx,dy);
 };
 function reset(){load(cur);}
+
+// ── People-tracker controls ─────────────────────────────────────────────────
+// 3×3 floor grid in front of the sensor (world coords from /lidar/scan).
+// Cells:  (mid,top)=↑  (left,mid)=←  (mid,mid)=idle  (right,mid)=→  (mid,bot)=↓
+// Move fires once on cell-entry; same-cell re-entry needs leaving first.
+// All sizes in metres. Shrink GRID_HX / extend GRID_Y0..1 to taste.
+var GRID_HX  = 0.75;          // half-width of grid (x ∈ [-HX, +HX])
+var GRID_Y0  = 1.0;           // near edge of grid (y minimum)
+var GRID_Y1  = 2.5;           // far edge of grid (y maximum)
+var CELL_HX  = 0.25;          // half-width of the centre column (idle / up / down lane)
+var CELL_Y_NEAR = 1.5;        // boundary between top (near, ↑) and middle rows
+var CELL_Y_FAR  = 2.0;        // boundary between middle and bottom (far, ↓) rows
+var trackerOn = true;
+var lastCell = 'none';
+function cellFor(p){
+  if(!p) return 'none';
+  var x = p.x, y = p.y;
+  if (y < GRID_Y0 || y > GRID_Y1 || x < -GRID_HX || x > GRID_HX) return 'outside';
+  var col = x < -CELL_HX ? 0 : (x > CELL_HX ? 2 : 1);
+  // row 0 = near sensor (top of grid display, "up"), 2 = far from sensor (bottom, "down").
+  var row = y < CELL_Y_NEAR ? 0 : (y > CELL_Y_FAR ? 2 : 1);
+  if (col === 1 && row === 0) return 'up';
+  if (col === 0 && row === 1) return 'left';
+  if (col === 1 && row === 1) return 'idle';
+  if (col === 2 && row === 1) return 'right';
+  if (col === 1 && row === 2) return 'down';
+  return 'corner';
+}
+function updateGrid(cell, p){
+  var cells = document.querySelectorAll('#trkGrid .tc');
+  for (var i = 0; i < cells.length; i++) cells[i].classList.remove('active');
+  var el = document.querySelector('#trkGrid .tc[data-cell="'+cell+'"]');
+  if (el) el.classList.add('active');
+  var s = cell;
+  if (p) s += ' (x=' + (p.x>=0?'+':'') + p.x.toFixed(2) + ' y=' + p.y.toFixed(2) + ')';
+  document.getElementById('trkStatus').innerText = s;
+  // Absolute-position dot inside the mini-grid (top-down floor view).
+  // Grid spans world x ∈ [-GRID_HX, +GRID_HX] m, y ∈ [GRID_Y0, GRID_Y1] m.
+  // Grid is 222×222 px (3 cells × 70 px + 2 gaps × 6 px); y=GRID_Y0 maps to the top.
+  var dot = document.getElementById('trkDot');
+  if (!p) { dot.style.display = 'none'; return; }
+  var GW = 222, GH = 222;
+  var lx = (p.x + GRID_HX) / (2 * GRID_HX) * GW;
+  var ly = (p.y - GRID_Y0) / (GRID_Y1 - GRID_Y0) * GH;
+  if (lx < 0) lx = 0; else if (lx > GW) lx = GW;
+  if (ly < 0) ly = 0; else if (ly > GH) ly = GH;
+  dot.style.left = lx + 'px';
+  dot.style.top  = ly + 'px';
+  dot.style.display = 'block';
+}
+function trkToggle(){
+  trackerOn = !trackerOn;
+  document.getElementById('trkBtn').innerText = 'Tracker: ' + (trackerOn ? 'ON' : 'OFF');
+  document.body.classList.toggle('trk-on', trackerOn);
+  if (!trackerOn) { lastCell = 'none'; updateGrid('off', null); }
+}
+async function trkPoll(){
+  if (trackerOn) {
+    try{
+      var r = await fetch('/lidar/scan', {cache:'no-store'});
+      var d = await r.json();
+      var p = (d && d.persons && d.persons.length) ? d.persons[0] : null;
+      var cell = cellFor(p);
+      updateGrid(cell, p);
+      if (cell !== lastCell) {
+        if (cell === 'up')         mvK(0, -1);
+        else if (cell === 'down')  mvK(0,  1);
+        else if (cell === 'left')  mvK(-1, 0);
+        else if (cell === 'right') mvK( 1, 0);
+        lastCell = cell;
+      }
+    } catch (e) {}
+  }
+  setTimeout(trkPoll, 150);
+}
+trkPoll();
+
 setInterval(()=>fetch('/ping'),1000);
 load(0);
 </script></body></html>)rawhtml");
