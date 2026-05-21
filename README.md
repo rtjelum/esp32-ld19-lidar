@@ -42,6 +42,21 @@ To compile and flash:
 make
 ```
 
+### WiFi Setup
+
+On first boot — or any boot with no stored credentials — the device starts a SoftAP captive setup:
+
+1. Connect your phone or laptop to the WiFi network **`battle-setup`** (open, no password).
+2. Open **http://192.168.4.1/** in a browser. The setup page scans for nearby networks.
+3. Tap an SSID to fill the field (or type it manually), enter the password, and press **Connect**.
+4. The device stores the credentials in flash and reboots. The AMOLED then shows the station-mode URL (typically `http://battle.local/` via mDNS).
+
+To re-do setup later, open a serial console at 115200 baud and type one of:
+
+- `clear` — wipes stored WiFi credentials and reboots into setup mode
+- `reboot` — restart the device
+- `help` — list commands
+
 ### Enclosure Design
 The 3D-printable box is generated using a Python script that leverages geometric libraries.
 
