@@ -57,6 +57,20 @@ To re-do setup later, open a serial console at 115200 baud and type one of:
 - `reboot` — restart the device
 - `help` — list commands
 
+### Sokoban
+
+The device serves a built-in Sokoban game at **http://battle.local/sokoban** (or `/sokoban` on whichever IP is shown on the display).
+
+![Sokoban running in a browser](IMG_3441.jpg)
+*Sokoban running on the embedded web server, rendered isometrically.*
+
+Push the green crates onto the pink goal pads. Each pad must hold one crate to clear the level — there are 50 levels in total, advancing automatically when the last crate is placed. Crates can only be pushed (never pulled) and only when the square behind them is empty, so plan ahead.
+
+Two control modes:
+
+- **D-pad / arrow keys** — tap the on-screen pad or use arrow keys on a desktop.
+- **LiDAR motion control** — toggle **Tracker: ON** to stand in front of the sensor and step into one of the four direction cells in the 3×3 floor grid (the centre cell is "idle"). Each cell-entry fires one move; you have to step back to idle before re-entering the same cell.
+
 ### Enclosure Design
 The 3D-printable box is generated using a Python script that leverages geometric libraries.
 
