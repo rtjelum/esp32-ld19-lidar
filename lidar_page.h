@@ -27,6 +27,8 @@ a{color:#7cf0ff;font-size:.8rem}
   <button id='raw'>Raw</button>
   <button id='hold'>Hold</button>
   <button id='mirror'>Mirror</button>
+  <button id='record'>Record</button>
+  <button id='mapBtn'>Map</button>
 </div>
 <div id='ppllist'>People detection off</div>
 <a href='/sokoban'>Sokoban &rarr;</a>
@@ -39,6 +41,8 @@ var WX0=-4,WX1=4,WY0=0,WY1=5;
 var prevX=new Float32Array(360),prevY=new Float32Array(360),prevTime=new Float64Array(360);
 var prevSeen=new Uint8Array(360),speedBins=new Float32Array(360);
 var personsOn=true,lastPersons=[],mirror=false;
+var recording=false, recordedData=[];
+var mapOn=false, refMap=null, refBbox=null, mapFetching=false, refMapN=0, poseTrail=[], lastPose=null;
 var SENSOR_ROT_DEG=270; // physical front sits at sensor angle 270°
 var WALL_CSS=70;   // wall extrusion height in CSS px
 var WALL_PX=WALL_CSS*dpr;
@@ -65,6 +69,109 @@ document.getElementById('pplBtn').onclick=function(){
 document.getElementById('mirror').onclick=function(){
   mirror=!mirror;this.classList.toggle('on',mirror);
 };
+document.getElementById('record').onclick=function(){
+  recording=!recording;
+  this.classList.toggle('on',recording);
+  this.innerText=recording?'Stop':'Record';
+  if(!recording){
+    var a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(recordedData)],{type:'application/json'}));
+    a.download='lidar_data.json';
+    a.click();
+    recordedData=[];
+  }
+};
+function fetchMap(){
+  if(mapFetching) return;
+  mapFetching=true;
+  fetch('/lidar/map',{cache:'no-store'}).then(function(r){return r.json();}).then(function(m){
+    refMap=m.pts; refMapN=m.n;
+    if(refMap.length){
+      var xs=refMap.map(function(p){return p[0];}),ys=refMap.map(function(p){return p[1];});
+      var pad=0.5;
+      refBbox=[Math.min.apply(null,xs)-pad,Math.min.apply(null,ys)-pad,
+               Math.max.apply(null,xs)+pad,Math.max.apply(null,ys)+pad];
+    }
+    mapFetching=false;
+  }).catch(function(){mapFetching=false;});
+}
+document.getElementById('mapBtn').onclick=function(){
+  mapOn=!mapOn;this.classList.toggle('on',mapOn);
+  if(mapOn){
+    // Fresh start: clear local cache, ask device to re-seed, then poll for
+    // the new map. Until seeding finishes (~4 s) lastPose.valid stays false
+    // and drawMap shows the "Seeding…" message.
+    refMap=null;refBbox=null;refMapN=0;poseTrail=[];lastPose=null;
+    fetch('/lidar/map/reset',{method:'POST'}).catch(function(){});
+  }
+};
+function drawMap(d){
+  // Map-frame render. Reference map = grey dots, current scan (transformed by
+  // pose) = red, robot = blue dot + heading line, trail = green.
+  var w=c.width,h=c.height;
+  ctx.fillStyle='#02050d';ctx.fillRect(0,0,w,h);
+  if(!refMap||!refBbox||refMap.length===0){
+    ctx.fillStyle='#a8b0d0';ctx.font=(14*dpr)+'px sans-serif';
+    var msg = (lastPose && !lastPose.valid) ? 'Seeding map (hold still)…' : 'Loading map…';
+    ctx.fillText(msg,20*dpr,30*dpr);
+    return;
+  }
+  var bx0=refBbox[0],by0=refBbox[1],bx1=refBbox[2],by1=refBbox[3];
+  var bw=bx1-bx0,bh=by1-by0;
+  var sx=w/bw,sy=h/bh,sc=Math.min(sx,sy);
+  var ox=(w-bw*sc)/2-bx0*sc, oy=(h-bh*sc)/2-by0*sc;
+  function mx(x){return x*sc+ox;}
+  function my(y){return h-(y*sc+oy);} // flip y so +y is up
+  ctx.fillStyle='#3a4060';
+  for(var i=0;i<refMap.length;i++){
+    var p=refMap[i];
+    ctx.fillRect(mx(p[0])-1,my(p[1])-1,2,2);
+  }
+  // Current scan transformed into world frame using lastPose
+  if(lastPose && lastPose.valid && d && d.pts){
+    var cx=Math.cos(lastPose.th),sy2=Math.sin(lastPose.th);
+    ctx.fillStyle='rgba(228,68,68,0.85)';
+    for(var i=0;i<d.pts.length;i+=2){
+      var q=d.pts[i];
+      var dmm=q[1]; if(dmm<100||dmm>=5000) continue;
+      var a=q[0]/100*Math.PI/180;
+      var lx=Math.cos(a)*dmm/1000, ly=Math.sin(a)*dmm/1000;
+      var wx=cx*lx-sy2*ly+lastPose.x;
+      var wy=sy2*lx+cx*ly+lastPose.y;
+      ctx.beginPath();ctx.arc(mx(wx),my(wy),1.5*dpr,0,Math.PI*2);ctx.fill();
+    }
+  }
+  // Trail
+  if(poseTrail.length>1){
+    ctx.strokeStyle='#4a8';ctx.lineWidth=1.5*dpr;
+    ctx.beginPath();
+    for(var i=0;i<poseTrail.length;i++){
+      var p=poseTrail[i];
+      if(i===0) ctx.moveTo(mx(p[0]),my(p[1])); else ctx.lineTo(mx(p[0]),my(p[1]));
+    }
+    ctx.stroke();
+  }
+  // Robot
+  if(lastPose && lastPose.valid){
+    var rx=mx(lastPose.x),ry=my(lastPose.y);
+    ctx.fillStyle='#27f';
+    ctx.beginPath();ctx.arc(rx,ry,6*dpr,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle='#27f';ctx.lineWidth=2*dpr;
+    var hx=rx+Math.cos(lastPose.th)*20*dpr;
+    var hy=ry-Math.sin(lastPose.th)*20*dpr;
+    ctx.beginPath();ctx.moveTo(rx,ry);ctx.lineTo(hx,hy);ctx.stroke();
+  }
+  // Status overlay
+  ctx.fillStyle='#a8b0d0';ctx.font=(12*dpr)+'px monospace';
+  var status='map: '+refMapN+' pts';
+  if(lastPose){
+    status+='  pose: '+(lastPose.valid?'tracking':'not locked');
+    if(lastPose.valid){
+      status+='  err='+lastPose.err.toFixed(3)+'m  in='+lastPose.in;
+    }
+  }
+  ctx.fillText(status,8*dpr,16*dpr);
+}
 function w2x(x){return (x-WX0)/(WX1-WX0)*c.width;}
 function w2y(y){return WALL_PX + (y-WY0)/(WY1-WY0)*(c.height-WALL_PX);}
 function drawSmiley(px,py,r){
@@ -77,6 +184,7 @@ function drawSmiley(px,py,r){
   ctx.beginPath();ctx.arc(px,py+r*0.05,r*0.45,0.15*Math.PI,0.85*Math.PI);ctx.stroke();
 }
 function draw(d){
+  if(recording) recordedData.push(d);
   if(d&&typeof d.area==='number')document.getElementById('area').innerText=d.area.toFixed(2);
   var w=c.width,h=c.height;
   ctx.fillStyle='#02050d';ctx.fillRect(0,0,w,h);
@@ -193,7 +301,20 @@ async function poll(){
     try{
       var r=await fetch('/lidar/scan',{cache:'no-store'});
       var d=await r.json();
-      draw(d);
+      if(d&&d.pose){
+        lastPose=d.pose;
+        if(d.pose.valid){
+          var t=poseTrail[poseTrail.length-1];
+          if(!t || (t[0]-d.pose.x)*(t[0]-d.pose.x)+(t[1]-d.pose.y)*(t[1]-d.pose.y)>0.0025){
+            poseTrail.push([d.pose.x,d.pose.y]);
+            if(poseTrail.length>400) poseTrail.shift();
+          }
+        }
+      }
+      // Map grew? Refetch — but only while the user is looking at it, to
+      // avoid hammering the device with full-map JSON every poll cycle.
+      if(mapOn && typeof d.map_n === 'number' && d.map_n !== refMapN) fetchMap();
+      if(mapOn) drawMap(d); else draw(d);
       frames++;
       var now=performance.now();
       if(now-lastFps>1000){document.getElementById('fps').innerText=(frames*1000/(now-lastFps)).toFixed(1);frames=0;lastFps=now;}

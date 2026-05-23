@@ -7,6 +7,7 @@
 #include "sokoban_page.h"
 #include "sokoban_levels.h"
 #include "setup_page.h"
+#include "localizer.h"
 
 // ── AMOLED (RM67162, 536×240 physical) ──────────────────────────────────────
 #define LCD_CS   6
@@ -81,6 +82,14 @@ static float personX[PERSON_MAX];     // meters, +right
 static float personY[PERSON_MAX];     // meters, +forward
 static float bgDist[360];    // mm, per-bin rolling background for shadow detection
 static volatile float lidarAreaM2 = 0.0f; // scanned polygon area in m²
+
+// ── Localization state ──────────────────────────────────────────────────────
+static portMUX_TYPE poseMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile float locX = 0.0f, locY = 0.0f, locTheta = 0.0f;
+static volatile float locErr = 0.0f;
+static volatile int   locInliers = 0;
+static volatile bool  locValid = false;     // true once first ICP converges
+static volatile bool  seedResetRequested = false;  // /lidar/map/reset sets this
 
 static const uint8_t LD19_CRC_TABLE[256] = {
   0x00,0x4d,0x9a,0xd7,0x79,0x34,0xe3,0xae,0xf2,0xbf,0x68,0x25,0x8b,0xc6,0x11,0x5c,
@@ -242,6 +251,96 @@ static String jsonEsc(const String& s) {
 void handlePing() {
   skLastSeen = millis();
   server.send(200, "text/plain", "ok");
+}
+
+// SLAM-lite. Wakes at ~5 Hz, snapshots the ring buffer, converts polar→
+// Cartesian (sensor frame), and runs a three-phase lifecycle:
+//   Phase A (first SEED_FRAMES valid frames, robot must be stationary):
+//     accumulate scan points into the map at pose (0,0,0). This defines the
+//     map's coordinate frame.
+//   Phase B (after seeding): run ICP each frame to track pose against the
+//     current map.
+//   Phase C (only when pose is trusted — low residual + lots of inliers):
+//     fold new scan points into the map so unexplored geometry gets added
+//     as the robot moves.
+void localizerTask(void *pv) {
+  static const int   SEED_FRAMES = 20;
+  static const float TRUST_ERR_M = 0.06f;       // mean inlier residual ≤ 6 cm
+  static const float TRUST_INLIER_RATIO = 0.15f; // ≥15% of scan must match map
+  static const int   TRUST_INLIER_MIN   = 20;    // absolute floor
+  static const float EXPAND_MIN_NEW_M = 0.08f;   // add points >8 cm from any neighbor
+
+  static LidarPt snap[LIDAR_BUF_POINTS];
+  static float sx[LOC_MAX_SRC], sy[LOC_MAX_SRC];
+  Pose2D pose = {0.0f, 0.0f, 0.0f};
+  int seedFramesDone = 0;
+
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(200));   // ~5 Hz
+
+    // Honor a re-seed request from /lidar/map/reset.
+    if (seedResetRequested) {
+      loc_map_clear();
+      pose = {0.0f, 0.0f, 0.0f};
+      seedFramesDone = 0;
+      seedResetRequested = false;
+      portENTER_CRITICAL(&poseMux);
+      locX = 0; locY = 0; locTheta = 0;
+      locErr = 0; locInliers = 0; locValid = false;
+      portEXIT_CRITICAL(&poseMux);
+    }
+
+    portENTER_CRITICAL(&lidarMux);
+    memcpy(snap, lidarBuf, sizeof(snap));
+    portEXIT_CRITICAL(&lidarMux);
+
+    // Convert valid points to sensor-frame Cartesian, evenly subsampled to
+    // ≤ LOC_MAX_SRC. Throw out clamped 5 m hits and obvious noise (<10 cm).
+    int n = 0;
+    int stride = LIDAR_BUF_POINTS / LOC_MAX_SRC; if (stride < 1) stride = 1;
+    for (int i = 0; i < LIDAR_BUF_POINTS && n < LOC_MAX_SRC; i += stride) {
+      uint16_t d_mm = snap[i].dist;
+      if (d_mm < 100 || d_mm >= 5000) continue;
+      float ang = (snap[i].angle_q2 / 100.0f) * (PI / 180.0f);
+      float d_m = d_mm / 1000.0f;
+      sx[n] = d_m * cosf(ang);
+      sy[n] = d_m * sinf(ang);
+      n++;
+    }
+    if (n < 30) continue;
+
+    if (seedFramesDone < SEED_FRAMES) {
+      // Phase A: build the initial map at the assumed origin pose.
+      loc_map_seed_add(sx, sy, n);
+      seedFramesDone++;
+      portENTER_CRITICAL(&poseMux);
+      locX = 0; locY = 0; locTheta = 0;
+      locErr = 0; locInliers = 0; locValid = false;
+      portEXIT_CRITICAL(&poseMux);
+      continue;
+    }
+
+    // Phase B: track pose against the existing map.
+    LocalizeResult r = loc_run(sx, sy, n, pose);
+    pose = r.pose;
+
+    // Phase C: grow the map with newly-seen geometry. Ratio-based gate so
+    // moving into a partially-unknown area still keeps expansion alive —
+    // as long as a fraction of the scan still anchors the pose to known
+    // geometry, we trust the result enough to add the unmatched returns.
+    int minInliers = (int)(n * TRUST_INLIER_RATIO);
+    if (minInliers < TRUST_INLIER_MIN) minInliers = TRUST_INLIER_MIN;
+    bool trusted = (r.err < TRUST_ERR_M) && (r.inliers >= minInliers);
+
+    if (trusted) {
+      loc_map_expand(sx, sy, n, pose, EXPAND_MIN_NEW_M);
+    }
+
+    portENTER_CRITICAL(&poseMux);
+    locX = pose.x; locY = pose.y; locTheta = pose.theta;
+    locErr = r.err; locInliers = r.inliers; locValid = trusted;
+    portEXIT_CRITICAL(&poseMux);
+  }
 }
 
 // Shadow-based person detection runs entirely in firmware so it works without the web GUI.
@@ -476,6 +575,53 @@ void handleLidarScan() {
     j += ",\"y\":"; j += String(pY[i], 3);
     j += "}";
   }
+  j += "]";
+
+  // Localized pose (if ICP has converged at least once)
+  float px, py, pth, pe; int pi; bool pv;
+  portENTER_CRITICAL(&poseMux);
+  px = locX; py = locY; pth = locTheta; pe = locErr; pi = locInliers; pv = locValid;
+  portEXIT_CRITICAL(&poseMux);
+  j += ",\"pose\":{\"valid\":";
+  j += (pv ? "true" : "false");
+  j += ",\"x\":";   j += String(px, 3);
+  j += ",\"y\":";   j += String(py, 3);
+  j += ",\"th\":";  j += String(pth, 4);
+  j += ",\"err\":"; j += String(pe, 3);
+  j += ",\"in\":";  j += String(pi);
+  j += "}";
+  j += ",\"map_n\":";
+  j += String(loc_map_count());
+  j += "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+// Request a re-seed: clears the map and re-enters phase A on the next
+// localizer tick. Replies immediately; actual reset is asynchronous.
+void handleLidarMapReset() {
+  seedResetRequested = true;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// Returns the live in-RAM map as JSON: {"n":N,"pts":[[x,y],...]}.
+// The page refetches when map_n in /lidar/scan changes (map grows).
+void handleLidarMap() {
+  int n = loc_map_count();
+  String j;
+  j.reserve(n * 16 + 32);
+  j += "{\"n\":";
+  j += String(n);
+  j += ",\"pts\":[";
+  for (int i = 0; i < n; i++) {
+    if (i) j += ',';
+    j += '[';
+    j += String(locMap[i][0], 3);
+    j += ',';
+    j += String(locMap[i][1], 3);
+    j += ']';
+  }
   j += "]}";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", j);
@@ -567,6 +713,8 @@ void setupWiFi() {
     server.on("/", handleRoot);
     server.on("/sokoban", handleSokoban);
     server.on("/lidar/scan", handleLidarScan);
+    server.on("/lidar/map",  handleLidarMap);
+    server.on("/lidar/map/reset", HTTP_POST, handleLidarMapReset);
     server.on("/lidar/speed", handleLidarSpeed);
     server.on("/ping", handlePing);
     server.begin();
@@ -686,6 +834,7 @@ void setup() {
   xTaskCreate(lidarControlTask, "lctrl", 2048, NULL, 1, NULL);
   xTaskCreate(personTask, "person", 4096, NULL, 1, NULL);
   xTaskCreate(displayTask, "disp", 4096, NULL, 1, NULL);
+  xTaskCreate(localizerTask, "loc", 8192, NULL, 1, NULL);
 }
 
 void loop() {
