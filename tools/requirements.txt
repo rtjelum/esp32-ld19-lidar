@@ -1,0 +1,18 @@
+# Deps for the .ldim toolchain (pull / view / floorplan / mcap / viz).
+# pull_recordings.py uses only the stdlib (urllib) — no install needed for it.
+
+# floorplan + quick view
+numpy
+matplotlib
+scipy
+scikit-image
+
+# .ldim -> MCAP conversion
+mcap
+mcap-ros2-support
+# rosbags pinned <0.10: the visualizer imports the old rosbags.typesys.types
+# module path that was removed in 0.10.
+rosbags<0.10
+
+# PRBonn lidar-visualizer (cloned on demand by the Makefile, installed editable).
+-e ./lidar-visualizer

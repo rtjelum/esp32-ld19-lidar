@@ -1,1 +1,9 @@
+.DS_Store
+imgui.ini
 build/
+build_touch/
+tools/.venv/
+lidar-visualizer/
+recordings/*.ldim
+recordings/*.mcap
+*_floorplan.png
