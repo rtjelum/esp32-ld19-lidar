@@ -17,7 +17,9 @@ PYTHON3 ?= python3.13
 VENV     = tools/.venv
 PY       = $(VENV)/bin/python
 VIZ_REPO ?= https://github.com/PRBonn/lidar-visualizer.git
-LDIM     ?= $(lastword $(sort $(wildcard recordings/*.ldim)))  # newest by name
+# Newest recording by name. Keep the comment on its own line: a trailing inline
+# comment would fold its leading spaces into the value and break quoted uses.
+LDIM     ?= $(lastword $(sort $(wildcard recordings/*.ldim)))
 
 # SKIP_MERGE no-ops the ESP32 post-link "esptool merge-bin" hook. That step
 # builds a 16 MB merged.bin that `arduino-cli upload` (and `verify` /
