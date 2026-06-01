@@ -115,6 +115,10 @@ make view                     # quick static matplotlib scatter
 
 All processing targets default to the newest recording; override with `LDIM=recordings/scan_002.ldim`, and the device host with `HOST=lidar.local`. The Python venv (`tools/.venv`) is created automatically and **pins Python 3.13** — the visualizer / `rosbags` lack wheels for 3.14. `make viz` clones [PRBonn/lidar-visualizer](https://github.com/PRBonn/lidar-visualizer) on demand.
 
+<img src="floorplan_sample.png" alt="Sample floorplan" width="350">
+
+*Floorplan from a ~50 s handheld walk (`make floorplan`): gyro deskew + ICP + loop closure.*
+
 Recordings can also be managed over a 115200-baud serial console: `ls` (list), `rm <file>`, `i2c` (scan both buses for the touch/IMU controllers).
 
 ### Enclosure Design
