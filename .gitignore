@@ -7,3 +7,5 @@ lidar-visualizer/
 recordings/*.ldim
 recordings/*.mcap
 *_floorplan.png
+.polyscope.ini
+__pycache__/

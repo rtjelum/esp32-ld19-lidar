@@ -16,7 +16,7 @@ HOST     = lidar.local
 PYTHON3 ?= python3.13
 VENV     = tools/.venv
 PY       = $(VENV)/bin/python
-VIZ_REPO ?= https://github.com/PRBonn/lidar-visualizer.git
+VIZ_REPO ?= https://github.com/rtjelum/lidar-visualizer_copy.git
 # Newest recording by name. Keep the comment on its own line: a trailing inline
 # comment would fold its leading spaces into the value and break quoted uses.
 LDIM     ?= $(lastword $(sort $(wildcard recordings/*.ldim)))
@@ -67,7 +67,7 @@ list:
 	arduino-cli board list
 
 # ── .ldim toolchain ───────────────────────────────────────────────────────────
-# PRBonn lidar-visualizer, cloned on demand (installed editable by the venv via
+# lidar-visualizer (rtjelum fork of PRBonn), cloned on demand (installed editable by the venv via
 # `-e ./lidar-visualizer` in requirements.txt). Not tracked in this repo.
 lidar-visualizer:
 	git clone --depth 1 $(VIZ_REPO) lidar-visualizer
@@ -105,4 +105,19 @@ viz: venv
 	@test -n "$(LDIM)" || { echo "no .ldim under recordings/ — run 'make pull-recordings' first"; exit 1; }
 	@out="$(LDIM:.ldim=.mcap)"; \
 	  if [ ! -f "$$out" ] || [ "$(LDIM)" -nt "$$out" ]; then $(PY) tools/ldim_to_mcap.py "$(LDIM)"; fi; \
+	  $(VENV)/bin/lidar_visualizer "$$out" --topic /points
+
+# Launch the 3D visualizer with full tilt compensation and frame-by-frame sequence.
+# Override with LDIM=recordings/scan_007.ldim.
+viz3d: venv
+	@test -n "$(LDIM)" || { echo "no .ldim under recordings/ — run 'make pull-recordings' first"; exit 1; }
+	@out="$(LDIM:.ldim=_3d.mcap)"; \
+	  if [ ! -f "$$out" ] || [ "$(LDIM)" -nt "$$out" ]; then $(PY) tools/ldim_to_3d_mcap.py "$(LDIM)"; fi; \
+	  $(VENV)/bin/lidar_visualizer "$$out" --topic /points
+
+# Launch a static merged 3D scan (one frame with all points).
+viz3d-static: venv
+	@test -n "$(LDIM)" || { echo "no .ldim under recordings/ — run 'make pull-recordings' first"; exit 1; }
+	@out="$(LDIM:.ldim=_static.mcap)"; \
+	  if [ ! -f "$$out" ] || [ "$(LDIM)" -nt "$$out" ]; then $(PY) tools/ldim_to_3d_mcap.py "$(LDIM)" --merge; fi; \
 	  $(VENV)/bin/lidar_visualizer "$$out" --topic /points
