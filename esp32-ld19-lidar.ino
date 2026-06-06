@@ -66,6 +66,11 @@ WebServer server(80);
 #define LIDAR_BAUD   230400
 #define LIDAR_PKT_LEN 47
 #define LIDAR_POINTS_PER_PKT 12
+// Returns are clamped to the LD19's rated maximum range. The sensor does not
+// report valid hits beyond this, so it acts as a safety ceiling rather than an
+// artificial limit. Front and rear are treated symmetrically to avoid the
+// rendering discontinuity at the 90°/270° boundary.
+#define LIDAR_MAX_RANGE_MM 12000
 static const int LIDAR_BUF_POINTS = 480; // ~40 packets, ≈ 1 full rotation @10Hz
 static volatile uint8_t  lidarPwmDuty   = 128;   // 50% — also LD19 external-mode entry duty
 static volatile bool     lidarMotorOn   = true;
@@ -574,12 +579,12 @@ void localizerTask(void *pv) {
     portEXIT_CRITICAL(&lidarMux);
 
     // Convert valid points to sensor-frame Cartesian, evenly subsampled to
-    // ≤ LOC_MAX_SRC. Throw out clamped 5 m hits and obvious noise (<10 cm).
+    // ≤ LOC_MAX_SRC. Throw out range-clamped hits and obvious noise (<10 cm).
     int n = 0;
     int stride = LIDAR_BUF_POINTS / LOC_MAX_SRC; if (stride < 1) stride = 1;
     for (int i = 0; i < LIDAR_BUF_POINTS && n < LOC_MAX_SRC; i += stride) {
       uint16_t d_mm = snap[i].dist;
-      if (d_mm < 100 || d_mm >= 5000) continue;
+      if (d_mm < 100 || d_mm >= LIDAR_MAX_RANGE_MM) continue;
       float ang = (snap[i].angle_q2 / 100.0f) * (PI / 180.0f);
       float d_m = d_mm / 1000.0f;
       sx[n] = d_m * cosf(ang);
@@ -656,7 +661,7 @@ void personTask(void *pv) {
 
     // Scanned area: front semicircle only (sensor bins 180..359 — front 180°).
     // Polar shoelace from sensor origin: A = 0.5 Σ r_i * r_{i+1} * sin(Δθ).
-    // Rear bins are excluded so the clamped 4 m back ring doesn't inflate the result.
+    // Rear bins are excluded so the area reflects the forward-facing scan only.
     float areaSum_mm2 = 0;
     int lastB = -1;
     float lastR = 0;
@@ -1130,10 +1135,8 @@ void lidarTask(void* pv) {
               uint8_t  inten = buf[o+2];
               uint32_t a = (uint32_t)startA + (uint32_t)(step * i);
               uint16_t ang = (uint16_t)(a % 36000);
-              // Cap all returns at 5 m. Treating front and rear symmetrically avoids the
-              // hard discontinuity at the 90°/270° boundary that produced a black wedge
-              // when the rear was force-clamped to 5 m while the front used live values.
-              if (dist > 5000) dist = 5000;
+              // Clamp to the sensor's rated max range (see LIDAR_MAX_RANGE_MM).
+              if (dist > LIDAR_MAX_RANGE_MM) dist = LIDAR_MAX_RANGE_MM;
               lidarBuf[lidarHead] = { ang, dist, inten };
               lidarHead = (lidarHead + 1) % LIDAR_BUF_POINTS;
               lidarSeq++;

@@ -29,7 +29,7 @@ SKIP_MERGE = --build-property "recipe.hooks.objcopy.postobjcopy.3.pattern=/usr/b
 
 .PHONY: all compile compile-full flash verify bootloader clean list \
         touch-compile touch-flash venv pull-recordings list-recordings \
-        view floorplan mcap viz
+        view floorplan mcap viz viz3d viz3d-static viz3d-merge
 
 all: compile flash
 
@@ -115,9 +115,20 @@ viz3d: venv
 	  if [ ! -f "$$out" ] || [ "$(LDIM)" -nt "$$out" ]; then $(PY) tools/ldim_to_3d_mcap.py "$(LDIM)"; fi; \
 	  $(VENV)/bin/lidar_visualizer "$$out" --topic /points
 
-# Launch a static merged 3D scan (one frame with all points).
+# Launch a static merged 3D scan (one frame with all points). Assumes the rig
+# only rotates (tripod/fixed-pivot tilt+pan); handheld translation will smear it.
 viz3d-static: venv
 	@test -n "$(LDIM)" || { echo "no .ldim under recordings/ — run 'make pull-recordings' first"; exit 1; }
 	@out="$(LDIM:.ldim=_static.mcap)"; \
 	  if [ ! -f "$$out" ] || [ "$(LDIM)" -nt "$$out" ]; then $(PY) tools/ldim_to_3d_mcap.py "$(LDIM)" --merge; fi; \
+	  $(VENV)/bin/lidar_visualizer "$$out" --topic /points
+
+# Launch a merged 3D scan with 6-DoF point-to-plane drift correction. Use this
+# instead of viz3d-static for handheld tilt scans: it registers keyframe submaps
+# to the growing map and corrects the translation drift that smears/doubles
+# walls. Override with LDIM=recordings/scan_007.ldim.
+viz3d-merge: venv
+	@test -n "$(LDIM)" || { echo "no .ldim under recordings/ — run 'make pull-recordings' first"; exit 1; }
+	@out="$(LDIM:.ldim=_merged6.mcap)"; \
+	  if [ ! -f "$$out" ] || [ "$(LDIM)" -nt "$$out" ]; then $(PY) tools/ldim_to_3d_mcap.py "$(LDIM)" --merge6; fi; \
 	  $(VENV)/bin/lidar_visualizer "$$out" --topic /points

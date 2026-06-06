@@ -133,7 +133,7 @@ function drawMap(d){
     ctx.fillStyle='rgba(228,68,68,0.85)';
     for(var i=0;i<d.pts.length;i+=2){
       var q=d.pts[i];
-      var dmm=q[1]; if(dmm<100||dmm>=5000) continue;
+      var dmm=q[1]; if(dmm<100||dmm>=12000) continue; // LD19 rated max range (mm)
       var a=q[0]/100*Math.PI/180;
       var lx=Math.cos(a)*dmm/1000, ly=Math.sin(a)*dmm/1000;
       var wx=cx*lx-sy2*ly+lastPose.x;
