@@ -105,15 +105,22 @@ make flash          # restore the LiDAR firmware
 Recordings are written to the onboard FAT partition as `scan_NNN.ldim` (raw LD19 packets + mount-corrected IMU samples, the same format as the companion `rasp_pi_zero2_ld19_lidar` project). A host-side toolchain in `tools/` pulls them over WiFi and processes them.
 
 ```bash
+make gui                      # desktop control panel wrapping every tool below
 make pull-recordings          # download new .ldim from the device into recordings/
 make list-recordings          # list what's on the device (no download)
+make clear-device             # wipe all recordings on the device (skips the active one)
+make clear-recordings         # delete local recordings + derived .mcap/.png
 make floorplan                # gyro-deskew + ICP + loop-closure floorplan PNG
 make viz                      # interactive PRBonn lidar-visualizer (auto-builds MCAP)
 make mcap                     # just convert .ldim -> MCAP
 make view                     # quick static matplotlib scatter
+make dump                     # print a recording's duration + LD19/IMU counts
+make help                     # list every make target
 ```
 
-All processing targets default to the newest recording; override with `LDIM=recordings/scan_002.ldim`, and the device host with `HOST=lidar.local`. The Python venv (`tools/.venv`) is created automatically and **pins Python 3.13** — the visualizer / `rosbags` lack wheels for 3.14. `make viz` clones [PRBonn/lidar-visualizer](https://github.com/PRBonn/lidar-visualizer) on demand.
+All processing targets default to the newest recording; override with `LDIM=recordings/scan_002.ldim`, and the device host with `HOST=lidar.local`. The Python venv (`tools/.venv`) is created automatically and **pins Python 3.13** (the visualizer / `rosbags` lack wheels for 3.14). `make viz` clones [PRBonn/lidar-visualizer](https://github.com/PRBonn/lidar-visualizer) on demand.
+
+`make gui` (`lidar_gui.py`) is a Tkinter front-end for all of the above: pull/clear recordings, browse local `.ldim` files, run the 2D/3D visualizers and floorplan builder on the selected file, and compile/flash the firmware, with live command output in a log pane. It is stdlib-only and shells out to these same make targets, so it needs Python 3.13 (the system `python3` ships without tkinter).
 
 <img src="floorplan_sample.png" alt="Sample floorplan" width="350">
 
@@ -141,7 +148,8 @@ This will produce `lidar_tdisplay_box_bottom.stl` and `lidar_tdisplay_box_top.st
 - `esp32-ld19-lidar.ino`: Main Arduino firmware.
 - `lidar_page.h`, `sokoban_page.h`, `setup_page.h`, `sokoban_levels.h`, `localizer.h`: Web-page HTML, Sokoban data, and the localizer, included by the sketch.
 - `touch_test/`: Standalone CST816 touch-panel test sketch (`make touch-flash`).
-- `tools/`: Host `.ldim` toolchain — `pull_recordings.py`, `view_ldim.py`, `ldim_to_floorplan.py`, `ldim_to_mcap.py`, `ldim_dump.py`.
+- `lidar_gui.py`: Tkinter desktop control panel for the host toolchain (`make gui`).
+- `tools/`: Host `.ldim` toolchain — `pull_recordings.py`, `view_ldim.py`, `ldim_to_floorplan.py`, `ldim_to_mcap.py`, `ldim_to_3d_mcap.py`, `ldim_dump.py`.
 - `build_box.py`: Python script to generate the 3D enclosure.
 - `makefile`: Build system for the firmware and the host toolchain.
 - `*.stl`: Generated 3D models for printing.

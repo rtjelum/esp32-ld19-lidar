@@ -27,9 +27,9 @@ LDIM     ?= $(lastword $(sort $(wildcard recordings/*.ldim)))
 # partitions, and sketch .bin files. Skipping it saves ~8 s per build.
 SKIP_MERGE = --build-property "recipe.hooks.objcopy.postobjcopy.3.pattern=/usr/bin/true"
 
-.PHONY: all help compile compile-full flash verify bootloader clean list \
+.PHONY: all help gui compile compile-full flash verify bootloader clean list \
         touch-compile touch-flash venv pull-recordings list-recordings \
-        clear-recordings clear-device \
+        clear-recordings clear-device dump \
         view floorplan mcap viz viz3d viz3d-static viz3d-merge
 
 all: compile flash
@@ -38,6 +38,12 @@ all: compile flash
 help:
 	@echo "Targets:"
 	@awk -F: '/^[a-zA-Z0-9][a-zA-Z0-9_-]*:/ { print "  " $$1 }' $(MAKEFILE_LIST) | sort -u
+
+# Desktop control panel (Tkinter) wrapping every tool below. Needs python3.13
+# (the system python3 ships without tkinter); the GUI itself is stdlib-only and
+# shells out to these make targets, building the venv on demand.
+gui:
+	$(PYTHON3) lidar_gui.py
 
 compile:
 	arduino-cli compile --fqbn $(FQBN) --build-path $(BUILD_DIR) $(SKIP_MERGE) $(CURDIR)
@@ -99,6 +105,10 @@ clear-recordings:
 # Wipe all recordings on the device over WiFi (skips the file being recorded).
 clear-device:
 	python3 tools/pull_recordings.py --host $(HOST) --clear
+
+# Print a recording's summary (duration, LD19/IMU counts). stdlib-only, no venv.
+dump:
+	$(PYTHON3) tools/ldim_dump.py $(LDIM)
 
 # Quick static matplotlib scatter of a recording (no extra repo needed).
 # Override the file with LDIM=recordings/scan_002.ldim.
