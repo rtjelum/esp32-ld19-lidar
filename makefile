@@ -27,11 +27,17 @@ LDIM     ?= $(lastword $(sort $(wildcard recordings/*.ldim)))
 # partitions, and sketch .bin files. Skipping it saves ~8 s per build.
 SKIP_MERGE = --build-property "recipe.hooks.objcopy.postobjcopy.3.pattern=/usr/bin/true"
 
-.PHONY: all compile compile-full flash verify bootloader clean list \
+.PHONY: all help compile compile-full flash verify bootloader clean list \
         touch-compile touch-flash venv pull-recordings list-recordings \
+        clear-recordings clear-device \
         view floorplan mcap viz viz3d viz3d-static viz3d-merge
 
 all: compile flash
+
+# List every target defined in this makefile.
+help:
+	@echo "Targets:"
+	@awk -F: '/^[a-zA-Z0-9][a-zA-Z0-9_-]*:/ { print "  " $$1 }' $(MAKEFILE_LIST) | sort -u
 
 compile:
 	arduino-cli compile --fqbn $(FQBN) --build-path $(BUILD_DIR) $(SKIP_MERGE) $(CURDIR)
@@ -85,6 +91,14 @@ pull-recordings:
 
 list-recordings:
 	python3 tools/pull_recordings.py --host $(HOST) --list
+
+# Delete all local recordings and their derived artifacts (keeps recordings/).
+clear-recordings:
+	rm -f recordings/*.ldim recordings/*.mcap recordings/*.png
+
+# Wipe all recordings on the device over WiFi (skips the file being recorded).
+clear-device:
+	python3 tools/pull_recordings.py --host $(HOST) --clear
 
 # Quick static matplotlib scatter of a recording (no extra repo needed).
 # Override the file with LDIM=recordings/scan_002.ldim.

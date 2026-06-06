@@ -289,6 +289,30 @@ static void recStop() {
   Serial.printf("[rec] stop scan_%03d.ldim (%u bytes)\n", recNo, (unsigned)recBytes);
 }
 
+// Delete every recording on the FAT partition except the one being recorded.
+// Returns the number of files removed. Re-scans from the root each pass so we
+// never remove a file out from under an open directory iterator.
+static int recRemoveAll() {
+  char curPath[32] = "";
+  if (recActive) snprintf(curPath, sizeof(curPath), "/scan_%03d.ldim", recNo);
+  int removed = 0;
+  for (;;) {
+    String victim;
+    File root = FFat.open("/");
+    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+      String p = f.name();
+      if (!p.startsWith("/")) p = "/" + p;
+      f.close();
+      if (p != curPath) { victim = p; break; }
+    }
+    root.close();
+    if (victim.length() == 0) break;
+    if (!FFat.remove(victim)) break;   // stop rather than spin if a remove fails
+    removed++;
+  }
+  return removed;
+}
+
 // Append one raw LD19 packet (47 bytes), type 0. Called from lidarTask.
 static void recWritePacket(const uint8_t* pkt) {
   if (!recActive) return;
@@ -973,6 +997,7 @@ void handleSokoban() {
 
 // ── Recording download API ──────────────────────────────────────────────────
 // GET /rec            -> JSON {"recording":bool,"free":N,"files":[{name,size}]}
+// DELETE /rec         -> wipe all recordings (skips the active one)
 // GET /rec/<file>     -> download the .ldim (octet-stream)
 // DELETE /rec/<file>  -> delete it
 // pull_recordings.py uses these to fetch .ldim files over WiFi.
@@ -996,6 +1021,16 @@ void handleRecList() {
   }
   root.close();
   j += "]}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+// DELETE /rec -> remove every recording except the one being recorded.
+void handleRecClear() {
+  int n = recRemoveAll();
+  String j = "{\"deleted\":";
+  j += String(n);
+  j += '}';
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", j);
 }
@@ -1072,6 +1107,7 @@ void setupWiFi() {
     server.on("/lidar/speed", handleLidarSpeed);
     server.on("/ping", handlePing);
     server.on("/rec", HTTP_GET, handleRecList);
+    server.on("/rec", HTTP_DELETE, handleRecClear);
     server.onNotFound(handleRecFile);   // serves /rec/<file> downloads + deletes
     server.begin();
     MDNS.begin("lidar");
@@ -1322,6 +1358,9 @@ void loop() {
       String fn = cmd.substring(3); fn.trim();
       if (!fn.startsWith("/")) fn = "/" + fn;
       Serial.println(FFat.remove(fn) ? "[rm] ok" : "[rm] failed");
+    } else if (cmd == "rmall") {
+      int n = recRemoveAll();
+      Serial.printf("[rmall] deleted %d file(s)\n", n);
     } else if (cmd == "i2c") {
       Serial.println("[i2c] scanning bus (SDA=3 SCL=2)...");
       int found = 0;
@@ -1362,6 +1401,7 @@ void loop() {
       Serial.println("  reboot - Restart the ESP32");
       Serial.println("  ls     - List recordings on the FAT partition");
       Serial.println("  rm F   - Delete recording F (e.g. rm scan_001.ldim)");
+      Serial.println("  rmall  - Delete all recordings (skips the active one)");
       Serial.println("  i2c    - Scan the I2C bus (touch / IMU detection)");
     }
   }
