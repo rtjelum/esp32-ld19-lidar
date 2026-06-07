@@ -324,17 +324,30 @@ def run_slam(scans, times, yaw_at):
         recent.append(apply_3d(M, scans[i]))
     return poses
 
-def close_loop(poses, scans):
+def close_loop(poses, scans, passes=4):
+    """Distribute the end->start yaw+xy drift along the trajectory when the scan
+    returns near where it started. A single distribution under-corrects: the
+    spread is weighted by cumulative motion, which is only approximate, so one
+    pass of a 16 deg loop error leaves a few degrees behind. Re-measure the
+    residual end->start transform and redistribute until it converges (~3
+    passes). Gated on actual end/start overlap, so a non-returning walk is left
+    untouched instead of being bent by a meaningless correction."""
     N, k = len(poses), 45
     if N < 2 * k: return poses
-    start_ref = voxel(np.vstack([apply_3d(poses[j], scans[j]) for j in range(k)]), 0.025)
-    end_glob = voxel(np.vstack([apply_3d(poses[j], scans[j]) for j in range(N - k, N)]), 0.025)
-    C = icp(end_glob, start_ref, np.eye(3), [(60, 2.0, 0.9), (50, 0.7, 0.92), (40, 0.25, 0.95)])
-    trans = [0.0] + [np.hypot(poses[i][0, 2] - poses[i - 1][0, 2], poses[i][1, 2] - poses[i - 1][1, 2]) for i in range(1, N)]
-    rot = [0.0] + [abs((yaw_of(poses[i]) - yaw_of(poses[i - 1]) + math.pi) % (2 * math.pi) - math.pi) for i in range(1, N)]
-    w = np.array(rot) * 2.0 + np.array(trans); f = np.cumsum(w); f = f / f[-1] if f[-1] > 0 else f
-    logC = logm(C).real
-    return [expm(f[i] * logC) @ poses[i] for i in range(N)]
+    for _ in range(passes):
+        start_ref = voxel(np.vstack([apply_3d(poses[j], scans[j]) for j in range(k)]), 0.025)
+        end_glob = voxel(np.vstack([apply_3d(poses[j], scans[j]) for j in range(N - k, N)]), 0.025)
+        C = icp(end_glob, start_ref, np.eye(3), [(60, 2.0, 0.9), (50, 0.7, 0.92), (40, 0.25, 0.95)])
+        d, _ = cKDTree(start_ref[:, :2]).query(end_glob[:, :2] @ C[:2, :2].T + C[:2, 2])
+        if np.mean(d < 0.25) <= 0.3: break          # gate: end must overlap start
+        relyaw = math.atan2(C[1, 0], C[0, 0])
+        if abs(relyaw) < 0.01 and math.hypot(C[0, 2], C[1, 2]) < 0.02: break   # converged
+        trans = [0.0] + [np.hypot(poses[i][0, 2] - poses[i - 1][0, 2], poses[i][1, 2] - poses[i - 1][1, 2]) for i in range(1, N)]
+        rot = [0.0] + [abs((yaw_of(poses[i]) - yaw_of(poses[i - 1]) + math.pi) % (2 * math.pi) - math.pi) for i in range(1, N)]
+        w = np.array(rot) * 2.0 + np.array(trans); f = np.cumsum(w); f = f / f[-1] if f[-1] > 0 else f
+        logC = logm(C).real
+        poses = [expm(f[i] * logC) @ poses[i] for i in range(N)]
+    return poses
 
 # --- 6-DoF point-to-plane registration (handheld tilt scans) -------------
 # The --merge path projects every point with the IMU orientation only and
@@ -506,6 +519,70 @@ def merge_icp6(scans, get_rot, key_dt=0.7e9, win=8, anchor_tilt_deg=30.0,
         out.append(np.column_stack([w, kf[i][:, 3]]))
     return np.vstack(out), smoothed
 
+# --- viz3d-stacked merge -------------------------------------------------
+
+def manhattan_yaw(merged, zlo=0.2, zhi=1.6, res=0.05, step=0.5):
+    """Yaw (radians) that snaps the dominant walls onto the X/Y axes.
+
+    Scan candidate rotations 0..90 deg; for each, rotate the wall-band points and
+    score how tightly their x and y coordinates pile onto a few lines (sum of
+    squared histogram-bin counts — tall, sparse peaks mean axis-aligned walls).
+    The best angle aligns the dominant wall pair to the grid. Cosmetic: it makes
+    the main walls look straight, it does not remove turn-to-turn drift."""
+    band = merged[(merged[:, 2] > zlo) & (merged[:, 2] < zhi)][:, :2]
+    if len(band) < 100: return 0.0
+    band = band - band.mean(0)
+    reach = np.abs(band).max() + res
+    edges = np.arange(-reach, reach + res, res)
+    best_deg, best_score = 0.0, -1.0
+    for deg in np.arange(0.0, 90.0, step):
+        th = math.radians(deg); c, s = math.cos(th), math.sin(th)
+        xr = band[:, 0] * c - band[:, 1] * s
+        yr = band[:, 0] * s + band[:, 1] * c
+        hx = np.histogram(xr, bins=edges)[0].astype(float)
+        hy = np.histogram(yr, bins=edges)[0].astype(float)
+        score = (hx * hx).sum() + (hy * hy).sum()
+        if score > best_score: best_score, best_deg = score, deg
+    return -math.radians(best_deg)
+
+def rotate_yaw(merged, yaw):
+    """Rotate an (N,4) cloud about Z by `yaw` radians (keep z, intensity)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    x = merged[:, 0] * c - merged[:, 1] * s
+    y = merged[:, 0] * s + merged[:, 1] * c
+    return np.column_stack([x, y, merged[:, 2], merged[:, 3]])
+
+def merge_viz3d(packets, get_rot, imu_ns, imu_wz):
+    """Collapse the viz3d frame sequence into a single cloud.
+
+    Reuses the viz3d geometry verbatim: each lidar revolution is deskewed against
+    its own mid-time orientation, tilted into the world by the absolute IMU
+    roll/pitch (yaw=0; the 2D SLAM owns yaw), and placed by the 2D SLAM pose
+    (xy + yaw). It then stacks every frame instead of emitting them one per
+    message. viz3d's rotation handling is clean because each frame's correction
+    is tiny and self-contained, and the 2D SLAM (scan-to-map + loop close)
+    absorbs the handheld translation/yaw drift — so there's none of merge_icp6's
+    3D tilt-vs-translation coupling. Returns (merged (N,4) cloud, t_ns)."""
+    scans, times = assemble_scans_3d(packets, get_rot)
+    yaw_at = build_yaw(imu_ns, imu_wz)
+    poses = close_loop(run_slam(scans, times, yaw_at), scans)
+    out = []
+    for P, s, t in zip(poses, scans, times):
+        roll, pitch, _ = get_rot(t)
+        # Absolute IMU tilt, constant across one frame: R = Pitch(Y) . Roll(X)
+        # (matches rotate_3d's Roll->Pitch->Yaw order with yaw=0).
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+        Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+        tilted = np.column_stack([s[:, :3] @ (Ry @ Rx).T, s[:, 3]])
+        out.append(apply_3d(P, tilted))
+    merged = np.vstack(out)
+    # Snap the dominant walls to the X/Y grid so they read as straight/aligned.
+    yaw = manhattan_yaw(merged)
+    print(f"  Manhattan snap: rotating cloud {math.degrees(yaw):+.1f} deg to align walls")
+    return rotate_yaw(merged, yaw), times[0]
+
 # --- ROS 2 formatting ----------------------------------------------------
 
 def ns_to_stamp(ns): return {'sec': int(ns // 1e9), 'nanosec': int(ns % 1e9)}
@@ -592,16 +669,15 @@ def main():
     pivot = tuple(float(v) for v in args.pivot.split(","))
 
     if args.merge6:
-        # Handheld tilt scan: project each revolution with the static geometry,
-        # then correct its residual 6-DoF pose against the growing map with
-        # point-to-plane ICP. Fixes the 0.5-1 m translation drift that the plain
-        # --merge can't, so walls stop smearing/doubling.
-        scans = assemble_static_scans(packets, get_rot, mount=mount, pivot=pivot)
-        print(f"6-DoF point-to-plane registration over {len(scans)} scans...")
-        merged, poses = merge_icp6(scans, get_rot)
-        drift = np.array([p[:3, 3] for p in poses])
-        print(f"  tracked motion: max |t|={np.linalg.norm(drift, axis=1).max():.2f} m")
-        write_single(view_transform(merged), scans[0][1])
+        # Handheld tilt scan: stack the viz3d frame sequence into one cloud.
+        # Each revolution keeps viz3d's clean per-frame rotation (relative deskew
+        # + absolute IMU tilt) and is placed by the 2D SLAM pose, which absorbs
+        # the handheld translation/yaw drift the plain --merge can't. (The older
+        # 3D point-to-plane path, merge_icp6, is kept available but coupled tilt
+        # into translation and distorted the cloud.)
+        print("Stacking viz3d frames into a single cloud (2D SLAM)...")
+        merged, t_ns = merge_viz3d(packets, get_rot, imu_ns, imu_wz)
+        write_single(view_transform(merged), t_ns)
     elif args.merge:
         # Stationary tilt+pan scan: pure IMU-orientation projection, no SLAM.
         # The rig doesn't translate, so 2D ICP on tilted slices would only

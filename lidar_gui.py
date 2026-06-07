@@ -60,12 +60,9 @@ def fetch_device_status(host, timeout=5):
 # Recording actions: (button label, make target, tooltip-ish note).
 RECORDING_ACTIONS = [
     ("Info",          "dump",         "Duration + LD19/IMU sample counts"),
-    ("View 2D",       "view",         "Static matplotlib scatter"),
-    ("Floorplan PNG", "floorplan",    "Deskew + ICP + loop closure, operator stripped; opens PNG"),
-    ("Build MCAP",    "mcap",         "LaserScan + PointCloud2 + Imu"),
-    ("Viz 2D",        "viz",          "Interactive PRBonn visualizer"),
-    ("Viz 3D",        "viz3d",        "Tilt-compensated frame sequence"),
-    ("Viz 3D static", "viz3d-static", "Merged single frame (tripod/pivot)"),
+    ("Floorplan PNG", "floorplan",    "Deskew + ICP + loop closure; shows in PNG Viewer tab"),
+    ("Viz Raw",        "viz",          "Interactive PRBonn visualizer"),
+    ("Viz Stabilized",        "viz3d",        "Tilt-compensated frame sequence"),
     ("Viz 3D merge",  "viz3d-merge",  "6-DoF drift-corrected merge (handheld)"),
 ]
 
@@ -106,15 +103,66 @@ class App:
                  fg="#9aa0a6", font=("Helvetica", 11)).pack(side="left", pady=10)
 
     def _build_body(self):
-        body = ttk.Frame(self.root, padding=10)
-        body.pack(fill="both", expand=False)
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+        self.nb = nb
+        self._build_control_tab(nb)
+        self._build_png_tab(nb)
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _build_control_tab(self, nb):
+        body = ttk.Frame(nb, padding=10)
+        nb.add(body, text="Control")
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
-
         self._build_device(body)
         self._build_recordings(body)
         self._build_recording_actions(body)
         self._build_maintenance(body)
+
+    def _on_tab_changed(self, _event=None):
+        # The Output console is a shared strip under the notebook; hide it on the
+        # PNG Viewer tab so the image gets the full height.
+        if not hasattr(self, "log_frame"):
+            return
+        on_png = self.nb.tab(self.nb.select(), "text") == "PNG Viewer"
+        if on_png:
+            self.log_frame.pack_forget()
+        elif not self.log_frame.winfo_ismapped():
+            self.log_frame.pack(fill="x", expand=False, padx=10, pady=(8, 8))
+
+    def _build_png_tab(self, nb):
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="PNG Viewer")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        self.png_var = tk.StringVar()
+        self.png_combo = ttk.Combobox(top, textvariable=self.png_var,
+                                      state="readonly")
+        self.png_combo.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.png_combo.bind("<<ComboboxSelected>>",
+                            lambda _e: self.show_png_selected())
+        ttk.Button(top, text="Refresh", command=self.refresh_pngs).grid(
+            row=0, column=1, padx=3)
+        ttk.Button(top, text="Open externally",
+                   command=self.open_png_external).grid(row=0, column=2, padx=3)
+
+        holder = ttk.Frame(tab, relief="sunken", borderwidth=1)
+        holder.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+        self._png_image = None       # keep a ref so Tk doesn't GC the image
+        self._png_path = None
+        self.png_label = tk.Label(holder, anchor="center", bg="#1e1e1e",
+                                  fg="#888", text="(no PNG selected)")
+        self.png_label.grid(row=0, column=0, sticky="nsew")
+        # Re-fit the image whenever the pane is resized.
+        self.png_label.bind("<Configure>", lambda _e: self._render_png())
+        self.refresh_pngs()
 
     def _mkbtn(self, parent, text, command, action=True, **grid):
         btn = ttk.Button(parent, text=text, command=command)
@@ -191,11 +239,12 @@ class App:
 
     def _build_log(self):
         f = ttk.LabelFrame(self.root, text="Output", padding=6)
-        f.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        f.pack(fill="x", expand=False, padx=10, pady=(8, 8))
+        self.log_frame = f
         f.rowconfigure(0, weight=1)
         f.columnconfigure(0, weight=1)
 
-        txt = tk.Text(f, height=12, wrap="none", state="disabled",
+        txt = tk.Text(f, height=10, wrap="none", state="disabled",
                       bg="#1e1e1e", fg="#e0e0e0", insertbackground="#e0e0e0",
                       font=("Menlo", 11), relief="flat")
         txt.grid(row=0, column=0, sticky="nsew")
@@ -334,13 +383,67 @@ class App:
         self.run(build_make_cmd(target, ldim=ldim), on_done=on_done)
 
     def _show_png(self, code, path):
-        """Open the floorplan PNG in the system viewer once the build succeeds."""
+        """Show the floorplan PNG in the PNG Viewer tab once the build succeeds."""
         if code != 0:
             return
-        if path.exists():
-            subprocess.Popen(["open", str(path)])
-        else:
+        if not path.exists():
             self.log(f"(floorplan finished but {path.name} not found)\n", "err")
+            return
+        self.refresh_pngs()
+        self.png_var.set(path.name)
+        self.show_png_selected()
+        self.nb.select(self.png_tab_index())
+
+    # ── PNG viewer ─────────────────────────────────────────────────────────────
+    def list_pngs(self):
+        if not RECORDINGS.is_dir():
+            return []
+        return sorted(RECORDINGS.glob("*.png"), key=lambda p: p.name)
+
+    def png_tab_index(self):
+        for i, tab in enumerate(self.nb.tabs()):
+            if self.nb.tab(tab, "text") == "PNG Viewer":
+                return i
+        return 0
+
+    def refresh_pngs(self):
+        names = [p.name for p in self.list_pngs()]
+        self.png_combo["values"] = names
+        if self.png_var.get() not in names:
+            self.png_var.set(names[-1] if names else "")
+        self.show_png_selected()
+
+    def show_png_selected(self):
+        name = self.png_var.get()
+        self._png_path = (RECORDINGS / name) if name else None
+        self._render_png()
+
+    def _render_png(self):
+        """Load the selected PNG and shrink it (integer subsample) to fit the
+        pane. Tk's PhotoImage reads PNG natively, so no Pillow dependency."""
+        label = self.png_label
+        if not self._png_path or not self._png_path.exists():
+            self._png_image = None
+            label.configure(image="", text="(no PNG selected)")
+            return
+        w, h = label.winfo_width(), label.winfo_height()
+        if w < 10 or h < 10:      # not laid out yet; a <Configure> will retry
+            return
+        try:
+            img = tk.PhotoImage(file=str(self._png_path))
+        except tk.TclError:
+            self._png_image = None
+            label.configure(image="", text=f"(cannot display {self._png_path.name})")
+            return
+        factor = max(1, -(-img.width() // w), -(-img.height() // h))  # ceil-div fit
+        if factor > 1:
+            img = img.subsample(factor)
+        self._png_image = img     # retain reference
+        label.configure(image=img, text="")
+
+    def open_png_external(self):
+        if self._png_path and self._png_path.exists():
+            subprocess.Popen(["open", str(self._png_path)])
 
     def pull(self):
         self.run(build_make_cmd("pull-recordings", host=self.host()),
