@@ -61,7 +61,7 @@ def fetch_device_status(host, timeout=5):
 RECORDING_ACTIONS = [
     ("Info",          "dump",         "Duration + LD19/IMU sample counts"),
     ("View 2D",       "view",         "Static matplotlib scatter"),
-    ("Floorplan PNG", "floorplan",    "Gyro deskew + ICP + loop closure"),
+    ("Floorplan PNG", "floorplan",    "Deskew + ICP + loop closure, operator stripped; opens PNG"),
     ("Build MCAP",    "mcap",         "LaserScan + PointCloud2 + Imu"),
     ("Viz 2D",        "viz",          "Interactive PRBonn visualizer"),
     ("Viz 3D",        "viz3d",        "Tilt-compensated frame sequence"),
@@ -327,7 +327,20 @@ class App:
         if not ldim:
             messagebox.showinfo("No recording", "Select a recording first.")
             return
-        self.run(build_make_cmd(target, ldim=ldim))
+        on_done = None
+        if target == "floorplan":
+            png = ROOT / (ldim.rsplit(".", 1)[0] + "_floorplan.png")
+            on_done = lambda code, p=png: self._show_png(code, p)
+        self.run(build_make_cmd(target, ldim=ldim), on_done=on_done)
+
+    def _show_png(self, code, path):
+        """Open the floorplan PNG in the system viewer once the build succeeds."""
+        if code != 0:
+            return
+        if path.exists():
+            subprocess.Popen(["open", str(path)])
+        else:
+            self.log(f"(floorplan finished but {path.name} not found)\n", "err")
 
     def pull(self):
         self.run(build_make_cmd("pull-recordings", host=self.host()),

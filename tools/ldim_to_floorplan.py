@@ -92,6 +92,58 @@ def load_ldim(path):
     return packets, imu_ns[order], imu_wz[order]
 
 
+# --- operator removal -----------------------------------------------------
+
+def strip_operator(packets, rng=1.0, frac=0.6, nbins=72, sector=None):
+    """Blank the operator from the scan, in memory. The operator walks close
+    behind the scanner, so their body is a persistent close-range return in a
+    fixed *sensor-frame* angular sector (it keeps the same bearing/range to the
+    rig as the room sweeps past). A direction that is always within `rng` never
+    sees the room, so it is safe to drop. We auto-detect those sectors (angular
+    bins near for > `frac` of the scan) unless `sector`=(lo,hi) deg is given, then
+    zero the distance of points in them closer than `rng`. A plain global near
+    cull misses the operator, whose torso sits at 0.3-0.8 m, not just <0.3 m.
+    Returns new packets with blanked points set to distance 0 (assemble skips
+    d<=0)."""
+    def ang_of(a0, span, i):
+        return (a0 + span * i / (LD19_POINTS - 1)) % 360.0
+    if sector is None:
+        near = [0] * nbins; tot = [0] * nbins; w = nbins / 360.0
+        for (_t, a0, a1, pts) in packets:
+            span = a1 - a0
+            if span < 0:
+                span += 360.0
+            for i, (d, _v) in enumerate(pts):
+                if d > 0:
+                    b = int(ang_of(a0, span, i) * w) % nbins
+                    tot[b] += 1
+                    if d / 1000.0 < rng:
+                        near[b] += 1
+        mask = [tot[b] > 0 and near[b] / tot[b] > frac for b in range(nbins)]
+        in_self = lambda a: mask[int(a * (nbins / 360.0)) % nbins]
+        label = f"auto {sum(mask)}/{nbins} bins"
+    else:
+        lo, hi = sector
+        in_self = lambda a: (lo <= a <= hi) if lo <= hi else (a >= lo or a <= hi)
+        label = f"sector {lo}-{hi} deg"
+
+    out, dropped, total = [], 0, 0
+    for (t_ns, a0, a1, pts) in packets:
+        span = a1 - a0
+        if span < 0:
+            span += 360.0
+        new = []
+        for i, (d, v) in enumerate(pts):
+            total += 1
+            if d > 0 and d / 1000.0 < rng and in_self(ang_of(a0, span, i)):
+                new.append((0, v)); dropped += 1
+            else:
+                new.append((d, v))
+        out.append((t_ns, a0, a1, new))
+    print(f"operator strip: blanked {dropped}/{total} returns (< {rng} m, {label})")
+    return out
+
+
 # --- deskew + scan assembly ----------------------------------------------
 
 def build_yaw(imu_ns, imu_wz):
@@ -388,6 +440,13 @@ def main():
                     help="keep the path trail (skip the declutter / streak removal)")
     ap.add_argument("--thin", action="store_true",
                     help="thin walls to single-pixel centerlines (like one scan frame)")
+    ap.add_argument("--keep-operator", action="store_true",
+                    help="do not strip the operator (close fixed-bearing returns)")
+    ap.add_argument("--self-range", type=float, default=1.0,
+                    help="operator strip max range in metres (default 1.0; the body sits "
+                         "at 0.3-0.8 m, so walls beyond ~1 m are kept)")
+    ap.add_argument("--self-ang", default="",
+                    help="force operator sector 'lo,hi' deg (wrap-aware) instead of auto-detect")
     args = ap.parse_args()
 
     out = args.output or args.input.rsplit(".", 1)[0] + "_floorplan.png"
@@ -395,6 +454,9 @@ def main():
     packets, imu_ns, imu_wz = load_ldim(args.input)
     print(f"{len(packets)} LD19 packets, {len(imu_ns)} IMU samples, "
           f"{(packets[-1][0] - packets[0][0]) / 1e9:.1f}s")
+    if not args.keep_operator:
+        sector = tuple(float(v) for v in args.self_ang.split(",")) if args.self_ang else None
+        packets = strip_operator(packets, rng=args.self_range, sector=sector)
     yaw_at = build_yaw(imu_ns, imu_wz)
     scans, times = assemble_scans(packets, yaw_at)
     print(f"{len(scans)} deskewed scans")

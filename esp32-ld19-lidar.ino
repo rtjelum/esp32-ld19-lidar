@@ -241,9 +241,11 @@ static int recNextNumber() {
 }
 
 // Append a record (12-byte header + payload). Caller must hold recMutex.
-static void recAppend(uint8_t type, const uint8_t* payload, uint16_t len) {
+// Append a record with an explicit monotonic timestamp (ns since recStartUs).
+// Used by the IMU path to back-date FIFO frames to their true acquisition time
+// instead of the (bunched) drain time.
+static void recAppendAt(uint8_t type, const uint8_t* payload, uint16_t len, uint64_t ns) {
   if (!recActive || !recFile) return;
-  uint64_t ns = (uint64_t)(esp_timer_get_time() - recStartUs) * 1000ull;
   uint8_t rh[12];
   memcpy(rh + 0, &ns, 8);
   rh[8] = type;
@@ -252,6 +254,10 @@ static void recAppend(uint8_t type, const uint8_t* payload, uint16_t len) {
   recFile.write(rh, 12);
   recFile.write(payload, len);
   recBytes += 12 + len;
+}
+
+static void recAppend(uint8_t type, const uint8_t* payload, uint16_t len) {
+  recAppendAt(type, payload, len, (uint64_t)(esp_timer_get_time() - recStartUs) * 1000ull);
 }
 
 static void recStart() {
@@ -322,11 +328,12 @@ static void recWritePacket(const uint8_t* pkt) {
 }
 
 // Append one BMI160 sample (12 bytes: GYR XYZ then ACC XYZ, mount-corrected
-// int16 LE), type 1. Called from imuTask. Matches the .ldim IMU payload spec.
-static void recWriteImu(const uint8_t* d12) {
+// int16 LE), type 1, at acquisition time ns. Called from imuTask. Matches the
+// .ldim IMU payload spec.
+static void recWriteImu(const uint8_t* d12, uint64_t ns) {
   if (!recActive) return;
   xSemaphoreTake(recMutex, portMAX_DELAY);
-  recAppend(1, d12, 12);
+  recAppendAt(1, d12, 12, ns);
   xSemaphoreGive(recMutex);
 }
 
@@ -356,9 +363,17 @@ static bool imuInit() {
   imuWrite(0x7E, 0x15); delay(80);   // CMD: gyro normal power mode
   imuWrite(0x41, 0x03);              // ACC_RANGE ±2g  -> 16384 LSB/g
   imuWrite(0x43, 0x00);              // GYR_RANGE ±2000 dps -> 16.4 LSB/dps
-  imuWrite(0x40, 0x28);              // ACC_CONF: ODR 100 Hz, normal filter
-  imuWrite(0x42, 0x28);              // GYR_CONF: ODR 100 Hz, normal filter
-  Serial.println("[imu] BMI160 ready @ 0x69 on Wire1 (accel + gyro)");
+  imuWrite(0x40, 0x2A);              // ACC_CONF: ODR 400 Hz, normal filter
+  imuWrite(0x42, 0x2A);              // GYR_CONF: ODR 400 Hz, normal filter
+
+  // FIFO: headerless, gyro + accel. With both axes enabled at the *same* ODR,
+  // each frame is a fixed 12 bytes (GYR XYZ then ACC XYZ, LE) — identical to the
+  // 0x0C burst the old polled path read, so frame parsing below reuses the same
+  // mount transform. imuTask drains the 1 KB FIFO in bursts, so the sample rate
+  // is set by the sensor ODR (400 Hz), not the task wake period.
+  imuWrite(0x47, 0xC0);              // FIFO_CONFIG_1: fifo_gyr_en + fifo_acc_en, headerless
+  imuWrite(0x7E, 0xB0); delay(2);    // CMD: fifo_flush (drop any partial/legacy frames)
+  Serial.println("[imu] BMI160 ready @ 0x69 on Wire1 (accel + gyro, FIFO 400 Hz)");
   return true;
 }
 
@@ -1231,48 +1246,89 @@ void touchTask(void *pv) {
   }
 }
 
-// Samples the BMI160 at ~100 Hz, records type-1 IMU records while recording, and
-// prints a live reading once a second so the sensor can be verified.
+// Parse one 12-byte headerless FIFO frame (GYR XYZ then ACC XYZ, raw int16 LE),
+// apply the mount transform, record a type-1 IMU sample, and update the smoothed
+// on-screen readout. Shared by every frame drained from the FIFO.
+static void imuHandleFrame(const uint8_t* d, uint64_t ns) {
+  int16_t gx = d[0]|(d[1]<<8),  gy = d[2]|(d[3]<<8),  gz = d[4]|(d[5]<<8);
+  int16_t ax = d[6]|(d[7]<<8),  ay = d[8]|(d[9]<<8),  az = d[10]|(d[11]<<8);
+
+  // Mount transform (+Y up -> conventional +Z up): X'=X, Y'=-Z, Z'=Y.
+  // Done as pure int16 sign/permutation so the *recorded* sample is already
+  // in the corrected frame — this matches the .ldim "mount-corrected" spec
+  // and makes recorded gyro Z the yaw axis the floorplan tool deskews on.
+  int16_t cg[3] = { gx, (int16_t)(-gz), gy };
+  int16_t ca[3] = { ax, (int16_t)(-az), ay };
+  uint8_t c[12];
+  memcpy(c + 0, cg, 6);
+  memcpy(c + 6, ca, 6);
+  recWriteImu(c, ns);
+
+  // EMA-smooth the corrected values for a steady on-screen readout.
+  const float a = 0.2f;
+  imuAx += a * (ca[0] / 16384.0f - imuAx);
+  imuAy += a * (ca[1] / 16384.0f - imuAy);
+  imuAz += a * (ca[2] / 16384.0f - imuAz);
+  imuGx += a * (cg[0] / 16.4f - imuGx);
+  imuGy += a * (cg[1] / 16.4f - imuGy);
+  imuGz += a * (cg[2] / 16.4f - imuGz);
+}
+
+// Drains the BMI160 FIFO (sensor sampling at 400 Hz, see imuInit), records a
+// type-1 IMU record per frame while recording, and prints a live reading once a
+// second so the sensor can be verified. The task wakes at 50 Hz; the FIFO (1 KB,
+// ~85 frames) buffers every sample between wakes, so the recorded rate follows
+// the sensor ODR rather than this wake period.
 void imuTask(void *pv) {
   imuOk = imuInit();
   uint32_t lastPrint = 0, lastDirty = 0;
+  uint64_t lastImuNs = 0;                          // last emitted stamp, for monotonicity
   for (;;) {
     if (!imuOk) { vTaskDelay(pdMS_TO_TICKS(1000)); imuOk = imuInit(); continue; }
-    uint8_t d[12];
-    if (imuReadReg(0x0C, d, 12)) {     // 0x0C: GYR XYZ then ACC XYZ, raw int16 LE
-      int16_t gx = d[0]|(d[1]<<8),  gy = d[2]|(d[3]<<8),  gz = d[4]|(d[5]<<8);
-      int16_t ax = d[6]|(d[7]<<8),  ay = d[8]|(d[9]<<8),  az = d[10]|(d[11]<<8);
+    if (!recActive) lastImuNs = 0;                 // reset between recordings
 
-      // Mount transform (+Y up -> conventional +Z up): X'=X, Y'=-Z, Z'=Y.
-      // Done as pure int16 sign/permutation so the *recorded* sample is already
-      // in the corrected frame — this matches the .ldim "mount-corrected" spec
-      // and makes recorded gyro Z the yaw axis the floorplan tool deskews on.
-      int16_t cg[3] = { gx, (int16_t)(-gz), gy };
-      int16_t ca[3] = { ax, (int16_t)(-az), ay };
-      uint8_t c[12];
-      memcpy(c + 0, cg, 6);
-      memcpy(c + 6, ca, 6);
-      recWriteImu(c);
-
-      // EMA-smooth the corrected values for a steady on-screen readout.
-      const float a = 0.2f;
-      imuAx += a * (ca[0] / 16384.0f - imuAx);
-      imuAy += a * (ca[1] / 16384.0f - imuAy);
-      imuAz += a * (ca[2] / 16384.0f - imuAz);
-      imuGx += a * (cg[0] / 16.4f - imuGx);
-      imuGy += a * (cg[1] / 16.4f - imuGy);
-      imuGz += a * (cg[2] / 16.4f - imuGz);
-
-      uint32_t now = millis();
-      if (imuView && now - lastDirty >= 100) { lastDirty = now; displayDirty = true; }
-      if (now - lastPrint >= 1000) {
-        lastPrint = now;
-        Serial.printf("[imu] acc=%.2f,%.2f,%.2f g  gyro=%.1f,%.1f,%.1f dps\n",
-                      (double)imuAx, (double)imuAy, (double)imuAz,
-                      (double)imuGx, (double)imuGy, (double)imuGz);
+    // Bytes currently queued (FIFO_LENGTH_0/1, 13-bit count). Read frame-aligned;
+    // any trailing partial frame is left in the FIFO for the next pass.
+    uint8_t ln[2];
+    if (imuReadReg(0x22, ln, 2)) {
+      uint16_t avail = ((uint16_t)ln[0] | ((uint16_t)(ln[1] & 0x07) << 8));
+      avail -= avail % 12;
+      uint16_t nframes = avail / 12;
+      // Back-date each frame from "now": the newest queued frame was sampled
+      // ~one ODR period ago, the oldest (nframes-1) periods ago. Stamping with
+      // the (bunched) drain time would mis-weight downstream dt integration; this
+      // reconstructs the true 400 Hz (IMU_PERIOD_US) spacing the sensor sampled at.
+      // nowUs is the same esp_timer clock the LD19 records on, so the two sensors
+      // stay co-timed. Clamp to lastImuNs so the per-drain seams stay monotonic.
+      const int64_t IMU_PERIOD_US = 2500;          // 400 Hz
+      int64_t nowUs = esp_timer_get_time();
+      uint16_t gi = 0;                             // global frame index, 0 = oldest
+      while (avail >= 12) {
+        uint8_t buf[120];                          // <= 10 frames per I2C burst
+        uint16_t chunk = avail > sizeof(buf) ? sizeof(buf) : avail;
+        if (!imuReadReg(0x24, buf, chunk)) break;  // FIFO_DATA, pointer auto-advances
+        for (uint16_t off = 0; off + 12 <= chunk; off += 12, gi++) {
+          int64_t us = nowUs - (int64_t)(nframes - 1 - gi) * IMU_PERIOD_US;
+          uint64_t ns = us > recStartUs ? (uint64_t)(us - recStartUs) * 1000ull : 0;
+          if (recActive) {
+            if (ns <= lastImuNs) ns = lastImuNs + 250000ull;  // +0.25ms, keep monotonic
+            lastImuNs = ns;
+          }
+          imuHandleFrame(buf + off, ns);
+        }
+        avail -= chunk;
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(10));     // 100 Hz
+
+    uint32_t now = millis();
+    if (imuView && now - lastDirty >= 100) { lastDirty = now; displayDirty = true; }
+    if (now - lastPrint >= 1000) {
+      lastPrint = now;
+      Serial.printf("[imu] acc=%.2f,%.2f,%.2f g  gyro=%.1f,%.1f,%.1f dps\n",
+                    (double)imuAx, (double)imuAy, (double)imuAz,
+                    (double)imuGx, (double)imuGy, (double)imuGz);
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));      // drain at 50 Hz; FIFO holds the 400 Hz samples
   }
 }
 
