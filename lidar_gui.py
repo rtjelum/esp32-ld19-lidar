@@ -377,7 +377,7 @@ class App:
             messagebox.showinfo("No recording", "Select a recording first.")
             return
         on_done = None
-        if target == "floorplan":
+        if target.startswith("floorplan"):
             png = ROOT / (ldim.rsplit(".", 1)[0] + "_floorplan.png")
             on_done = lambda code, p=png: self._show_png(code, p)
         self.run(build_make_cmd(target, ldim=ldim), on_done=on_done)

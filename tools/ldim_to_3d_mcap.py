@@ -144,6 +144,59 @@ def build_orientation(imu_data):
                 float(np.interp(t_ns, ts, ys)))
     return get_rot
 
+ACC_LSB_PER_G = 16384.0  # +/-2 g full-scale; |a| ~ this at rest (for the KF gate)
+
+def build_orientation_kf(imu_data, gate=0.03, q_ang=20.0, r_ang=1.0):
+    """Attitude (roll/pitch) via a Kalman filter that fuses gyro and accel.
+
+    Opt-in (`--kf`) alternative to build_orientation's fixed-gain complementary
+    filter. State = [roll, pitch] in rad; the gyro drives the predict, the accel
+    gravity-direction is the measurement, and the measurement noise R is inflated
+    smoothly with |a|/16384 - 1 so walking acceleration (which masquerades as
+    tilt) is down-weighted in proportion to motion. `gate` is the deviation
+    (fraction of g) at which R doubles. Yaw stays plain gyro integration."""
+    x = np.zeros(2)
+    P = np.eye(2) * 1e-2
+    I = np.eye(2)
+    yaw = 0.0
+    last_t = imu_data[0][0]
+    ts, rs, ps, ys = [], [], [], []
+    for _t, _w, a in imu_data:          # seed from first usable accel sample
+        ax, ay, az = a
+        if ax or ay or az:
+            x[0] = math.atan2(ay, az)
+            x[1] = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+            break
+    for t_ns, w, a in imu_data:
+        dt = (t_ns - last_t) / 1e9
+        last_t = t_ns
+        if dt <= 0:
+            dt = 1e-3
+        # --- Predict: integrate the GYRO body rates (w) ---
+        x[0] += w[0] * dt                       # roll  from gyro X
+        x[1] += w[1] * dt                       # pitch from gyro Y
+        P = P + I * (q_ang * dt * dt)
+        yaw += GYRO_SIGN * w[2] * dt            # yaw   from gyro Z (gyro-only)
+        # --- Correct: ACCELEROMETER (a) gravity direction, motion-weighted ---
+        ax, ay, az = a
+        a_norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if a_norm > 0:
+            z = np.array([math.atan2(ay, az),                 # accel roll
+                          math.atan2(-ax, math.sqrt(ay*ay + az*az))])  # accel pitch
+            dev = abs(a_norm / ACC_LSB_PER_G - 1.0)
+            R = I * (r_ang * (1.0 + (dev / gate) ** 2))
+            K = P @ np.linalg.inv(P + R)        # H = I
+            x = x + K @ (z - x)                 # fuse accel tilt into roll/pitch
+            P = (I - K) @ P
+        ts.append(t_ns); rs.append(x[0]); ps.append(x[1]); ys.append(yaw)
+    ts = np.array(ts, float); rs = np.array(rs); ps = np.array(ps); ys = np.array(ys)
+
+    def get_rot(t_ns):
+        return (float(np.interp(t_ns, ts, rs)),
+                float(np.interp(t_ns, ts, ps)),
+                float(np.interp(t_ns, ts, ys)))
+    return get_rot
+
 def rotate_3d(x, y, z, roll, pitch, yaw):
     """Rigid 3D rotation: Roll(x), Pitch(y), Yaw(z)."""
     # Roll (X)
@@ -612,6 +665,9 @@ def main():
                     help="merge into one frame with 6-DoF point-to-plane registration "
                          "(corrects handheld translation/drift; use for handheld tilt scans)")
     ap.add_argument("--debug", action="store_true", help="print the IMU orientation trajectory and exit")
+    ap.add_argument("--kf", action="store_true",
+                    help="use the motion-adaptive Kalman tilt filter instead of the default "
+                         "fixed-gain complementary filter")
     ap.add_argument("--mount", default="0,0,-90",
                     help="IMU<->lidar mount rotation 'roll,pitch,yaw' in deg. Default 0,0,-90 "
                          "(BMI160 yawed 90 deg from LD19). Flip to 0,0,90 if the cloud is "
@@ -632,7 +688,8 @@ def main():
     out = args.output or args.input.rsplit(".", 1)[0] + suffix
     packets, imu_ns, imu_wz, imu_data = load_ldim(args.input)
     print(f"Processing {args.input} with precise 3D deskewing...")
-    get_rot = build_orientation(imu_data)
+    get_rot = build_orientation_kf(imu_data) if args.kf else build_orientation(imu_data)
+    print(f"tilt: {'motion-adaptive Kalman filter' if args.kf else 'complementary filter (default)'}")
 
     if args.debug:
         t0 = imu_data[0][0]

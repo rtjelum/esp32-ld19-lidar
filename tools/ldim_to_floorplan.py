@@ -59,7 +59,7 @@ def load_ldim(path):
     packets: list of (abs_ns, start_deg, end_deg, [(dist_mm, intensity), ...])
     imu_wz:  yaw rate about z in rad/s.
     """
-    packets, imu_ns, imu_wz = [], [], []
+    packets, imu_ns, imu_wz, imu_data = [], [], [], []
     with open(path, "rb") as f:
         hdr = f.read(16)
         if len(hdr) != 16:
@@ -83,48 +83,97 @@ def load_ldim(path):
                 pts = [struct.unpack_from("<HB", pl, 6 + i * 3) for i in range(LD19_POINTS)]
                 packets.append((abs_ns, a0, a1, pts))
             elif type_ == TYPE_IMU:
-                _, _, gz, _, _, _ = struct.unpack("<hhhhhh", pl)
+                gx, gy, gz, ax, ay, az = struct.unpack("<hhhhhh", pl)
                 imu_ns.append(abs_ns)
-                imu_wz.append(GYRO_SIGN * gz / GYR_LSB_PER_DPS * DEG)
+                w = np.array([gx, gy, gz]) / 16.4 * (math.pi / 180.0)
+                a = np.array([ax, ay, az])
+                imu_data.append((abs_ns, w, a))
+                imu_wz.append(GYRO_SIGN * gz / 16.4 * (math.pi / 180.0))
     imu_ns = np.array(imu_ns, float)
     imu_wz = np.array(imu_wz)
     order = np.argsort(imu_ns)
-    return packets, imu_ns[order], imu_wz[order]
+    return packets, imu_ns[order], imu_wz[order], sorted(imu_data)
 
 
 # --- operator removal -----------------------------------------------------
 
-def strip_operator(packets, rng=1.0, frac=0.6, nbins=72, sector=None):
+def strip_operator(packets, rng=1.1, frac=0.5, nbins=72, sector=None, margin=0.3):
     """Blank the operator from the scan, in memory. The operator walks close
     behind the scanner, so their body is a persistent close-range return in a
     fixed *sensor-frame* angular sector (it keeps the same bearing/range to the
-    rig as the room sweeps past). A direction that is always within `rng` never
-    sees the room, so it is safe to drop. We auto-detect those sectors (angular
-    bins near for > `frac` of the scan) unless `sector`=(lo,hi) deg is given, then
-    zero the distance of points in them closer than `rng`. A plain global near
-    cull misses the operator, whose torso sits at 0.3-0.8 m, not just <0.3 m.
+    rig as the room sweeps past).
+
+    The discriminator vs. a real wall is *temporal persistence*: a wall is only
+    close while you walk past it (a minority of revolutions), but the operator
+    is close in nearly every revolution. So we split the recording into
+    revolutions and flag the bins that hold a near (< `rng`) return in more than
+    `frac` of them -- a far stronger signal than the old "what fraction of this
+    bin's returns are close" test, which a wall you walk alongside also trips.
+    The flagged sector is dilated one bin each side (the body's angular edges
+    sit just under threshold and otherwise leak a fringe), and points are
+    blanked only within `margin` of the operator's *own* per-bin range. That
+    range-band cull keeps a wall that later appears farther out in the same
+    bearing, which a flat near-cull would have eaten. The torso sits at
+    0.3-0.8 m, so a plain global <0.3 m cull misses it entirely.
+
+    Pass `sector`=(lo,hi) deg to force the bearing instead of auto-detecting.
     Returns new packets with blanked points set to distance 0 (assemble skips
     d<=0)."""
+    w = nbins / 360.0
     def ang_of(a0, span, i):
         return (a0 + span * i / (LD19_POINTS - 1)) % 360.0
+    def bin_of(a):
+        return int(a * w) % nbins
+
     if sector is None:
-        near = [0] * nbins; tot = [0] * nbins; w = nbins / 360.0
-        for (_t, a0, a1, pts) in packets:
-            span = a1 - a0
-            if span < 0:
-                span += 360.0
-            for i, (d, _v) in enumerate(pts):
-                if d > 0:
-                    b = int(ang_of(a0, span, i) * w) % nbins
-                    tot[b] += 1
-                    if d / 1000.0 < rng:
-                        near[b] += 1
-        mask = [tot[b] > 0 and near[b] / tot[b] > frac for b in range(nbins)]
-        in_self = lambda a: mask[int(a * (nbins / 360.0)) % nbins]
-        label = f"auto {sum(mask)}/{nbins} bins"
+        # Segment into revolutions on the a0 wrap (mirrors assemble_scans).
+        revs, cur, last_a0 = [], [], -1.0
+        for p in packets:
+            if p[1] < last_a0 - 180.0 and cur:
+                revs.append(cur); cur = []
+            cur.append(p); last_a0 = p[1]
+        if cur:
+            revs.append(cur)
+        # Per revolution, the closest near return seen in each bin = the
+        # operator candidate for that revolution.
+        present = np.zeros(nbins, int)
+        op_ranges = [[] for _ in range(nbins)]
+        for rev in revs:
+            closest = np.full(nbins, np.inf)
+            for (_t, a0, a1, pts) in rev:
+                span = a1 - a0
+                if span < 0:
+                    span += 360.0
+                for i, (d, _v) in enumerate(pts):
+                    dm = d / 1000.0
+                    if d > 0 and dm < rng:
+                        b = bin_of(ang_of(a0, span, i))
+                        if dm < closest[b]:
+                            closest[b] = dm
+            for b in np.nonzero(np.isfinite(closest))[0]:
+                present[b] += 1
+                op_ranges[b].append(closest[b])
+        occ = present / max(1, len(revs))
+        core = occ > frac
+        mask = core | np.roll(core, 1) | np.roll(core, -1)   # dilate +/-1 bin
+        edge = mask & ~core
+        # Core bins ARE the body: it sits at point-blank in every revolution and
+        # occludes whatever is behind it at that bearing, so there is no real
+        # wall to keep -- blank the whole sector out to rng. That clears the body
+        # at *every* range it appears, including the larger stand-off at the
+        # start of the capture, which a median-range band leaves as a "shadow".
+        # Dilated edge bins only clip the body's fringe and may catch a real
+        # wall, so there blank just within margin of the operator's own range.
+        thr = np.where(core, rng, 0.0)
+        for b in np.nonzero(edge)[0]:
+            thr[b] = min(rng, float(np.median(op_ranges[b])) + margin) if op_ranges[b] else 0.0
+        in_self = lambda a: mask[bin_of(a)]
+        thr_of = lambda a: thr[bin_of(a)]
+        label = f"auto {int(mask.sum())}/{nbins} bins, {len(revs)} revs"
     else:
         lo, hi = sector
         in_self = lambda a: (lo <= a <= hi) if lo <= hi else (a >= lo or a <= hi)
+        thr_of = lambda a: rng
         label = f"sector {lo}-{hi} deg"
 
     out, dropped, total = [], 0, 0
@@ -135,7 +184,8 @@ def strip_operator(packets, rng=1.0, frac=0.6, nbins=72, sector=None):
         new = []
         for i, (d, v) in enumerate(pts):
             total += 1
-            if d > 0 and d / 1000.0 < rng and in_self(ang_of(a0, span, i)):
+            a = ang_of(a0, span, i)
+            if d > 0 and d / 1000.0 < thr_of(a) and in_self(a):
                 new.append((0, v)); dropped += 1
             else:
                 new.append((d, v))
@@ -146,40 +196,148 @@ def strip_operator(packets, rng=1.0, frac=0.6, nbins=72, sector=None):
 
 # --- deskew + scan assembly ----------------------------------------------
 
-def build_yaw(imu_ns, imu_wz):
-    """Cumulative gyro-integrated heading; returns yaw_at(t_ns) interpolator."""
-    if len(imu_ns) < 2:
-        return lambda t: 0.0
-    cum = np.concatenate(
-        [[0.0], np.cumsum(np.diff(imu_ns) / 1e9 * (imu_wz[:-1] + imu_wz[1:]) * 0.5)])
-    return lambda t: float(np.interp(t, imu_ns, cum))
+def build_orientation(imu_data):
+    orientations = []
+    last_t = imu_data[0][0]
+    roll, pitch, yaw = 0.0, 0.0, 0.0
+    for t_ns, w, a in imu_data:
+        dt = (t_ns - last_t) / 1e9
+        last_t = t_ns
+        roll  += w[0] * dt
+        pitch += w[1] * dt
+        yaw   += GYRO_SIGN * w[2] * dt
+        ax, ay, az = a
+        a_norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if a_norm > 0:
+            a_roll  = math.atan2(ay, az)
+            a_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+            alpha = 0.02
+            roll  = (1 - alpha) * roll  + alpha * a_roll
+            pitch = (1 - alpha) * pitch + alpha * a_pitch
+        orientations.append((t_ns, roll, pitch, yaw))
+    ts = np.array([o[0] for o in orientations], float)
+    rs = np.array([o[1] for o in orientations])
+    ps = np.array([o[2] for o in orientations])
+    ys = np.array([o[3] for o in orientations])
+    def get_rot(t_ns):
+        return (float(np.interp(t_ns, ts, rs)),
+                float(np.interp(t_ns, ts, ps)),
+                float(np.interp(t_ns, ts, ys)))
+    return get_rot
 
 
-def assemble_scans(packets, yaw_at, rng=(0.05, 12.0), min_pts=50):
-    """Group packets into revolutions (start-angle wrap) and deskew each one
-    into the rig frame at the revolution's mid-time. Returns (scans, times)."""
+# Accel full-scale is +/-2 g at 16384 LSB/g (see imu-hardware notes), so a
+# sample at rest has |a| ~ ACC_LSB_PER_G. We only need this for the KF's
+# "is the accel currently just gravity?" test; the complementary filter uses
+# atan2 ratios where the scale cancels.
+ACC_LSB_PER_G = 16384.0
+
+
+def build_orientation_kf(imu_data, gate=0.03, q_ang=20.0, r_ang=1.0):
+    """Attitude (roll/pitch) via a Kalman filter that fuses gyro and accel.
+
+    This is the motion-noise-rejecting alternative to build_orientation's
+    fixed-gain complementary filter. State = [roll, pitch] in rad; the gyro
+    drives the prediction and the accelerometer supplies a gravity-direction
+    measurement that corrects integration drift.
+
+    The handheld catch is that walking acceleration adds to gravity, so the
+    accel-derived tilt is only trustworthy when |a| ~ 1 g. Rather than a fixed
+    complementary gain (which trusts a fake tilt while walking) or a hard gate,
+    the filter inflates the measurement noise R smoothly with how far |a|
+    strays from gravity, so motion noise is down-weighted in proportion to how
+    much motion there is. `gate` sets the deviation (fraction of g) at which R
+    has doubled; samples well past it are effectively ignored.
+
+    Yaw has no absolute reference on this rig (no magnetometer), so it stays a
+    plain gyro integration, sign-matched to the deskew convention.
+    """
+    x = np.zeros(2)              # [roll, pitch]
+    P = np.eye(2) * 1e-2
+    I = np.eye(2)
+    yaw = 0.0
+    last_t = imu_data[0][0]
+    ts, rs, ps, ys = [], [], [], []
+    # Seed roll/pitch from the first usable accel sample so we don't spend the
+    # first second of the scan converging up from a flat-zero guess.
+    for _t, _w, a in imu_data:
+        ax, ay, az = a
+        if ax or ay or az:
+            x[0] = math.atan2(ay, az)
+            x[1] = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+            break
+    for t_ns, w, a in imu_data:
+        dt = (t_ns - last_t) / 1e9
+        last_t = t_ns
+        if dt <= 0:
+            dt = 1e-3
+        # Predict: integrate the GYRO body rates (w); covariance grows with the
+        # gyro process noise over the step.
+        x[0] += w[0] * dt                       # roll  from gyro X
+        x[1] += w[1] * dt                       # pitch from gyro Y
+        P = P + I * (q_ang * dt * dt)
+        yaw += GYRO_SIGN * w[2] * dt            # yaw   from gyro Z (gyro-only)
+        # Correct: ACCELEROMETER (a) gravity direction, weighted by |a|-vs-1g.
+        ax, ay, az = a
+        a_norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if a_norm > 0:
+            z = np.array([math.atan2(ay, az),                 # accel roll
+                          math.atan2(-ax, math.sqrt(ay*ay + az*az))])  # accel pitch
+            dev = abs(a_norm / ACC_LSB_PER_G - 1.0)
+            R = I * (r_ang * (1.0 + (dev / gate) ** 2))
+            K = P @ np.linalg.inv(P + R)        # H = I
+            x = x + K @ (z - x)                 # fuse accel tilt into roll/pitch
+            P = (I - K) @ P
+        ts.append(t_ns); rs.append(x[0]); ps.append(x[1]); ys.append(yaw)
+    ts = np.array(ts, float); rs = np.array(rs); ps = np.array(ps); ys = np.array(ys)
+
+    def get_rot(t_ns):
+        return (float(np.interp(t_ns, ts, rs)),
+                float(np.interp(t_ns, ts, ps)),
+                float(np.interp(t_ns, ts, ys)))
+    return get_rot
+
+
+def rotate_3d(x, y, z, roll, pitch, yaw):
+    c, s = math.cos(roll), math.sin(roll)
+    y, z = c*y - s*z, s*y + c*z
+    c, s = math.cos(pitch), math.sin(pitch)
+    x, z = c*x + s*z, -s*x + c*z
+    c, s = math.cos(yaw), math.sin(yaw)
+    x, y = c*x - s*y, s*x + c*y
+    return x, y, z
+
+
+def assemble_scans(packets, get_rot, rng=(0.25, 12.0), min_pts=50):
+    # rng[0] is a global near floor: nothing real sits within 0.25 m of a
+    # handheld scanner, so this mops up point-blank clutter (a hand, or the
+    # operator's setup pose at the start) that the sensor-frame persistence
+    # strip can't catch because it only occupies that bearing for a moment.
     scans, times, cur, last_a0 = [], [], [], -1.0
+    PKT_NS = 3.33e6
 
     def flush(group):
         if len(group) < 20:
             return None
         t_ref = group[len(group) // 2][0]
-        y_ref = yaw_at(t_ref)
+        r_ref, p_ref, y_ref = get_rot(t_ref)
         out = []
         for (t_ns, a0, a1, pts) in group:
             span = a1 - a0
             if span < 0:
                 span += 360.0
-            dy = yaw_at(t_ns) - y_ref           # rig rotation since reference
-            c, s = math.cos(dy), math.sin(dy)
             for i, (d, _inten) in enumerate(pts):
                 if d <= 0:
                     continue
+                t_pt = t_ns + (i / (LD19_POINTS - 1)) * PKT_NS
+                r, p, y = get_rot(t_pt)
+                dy = y - y_ref
                 ang = (a0 + span * i / (LD19_POINTS - 1)) * DEG
                 d_m = d / 1000.0
-                x = -math.sin(ang) * d_m
-                y = math.cos(ang) * d_m
-                out.append((c * x - s * y, s * x + c * y))   # deskew rotate by +dy
+                lx, ly, lz = -math.sin(ang) * d_m, math.cos(ang) * d_m, 0.0
+                rx, ry, rz = rotate_3d(lx, ly, lz, r, p, dy)
+                if -0.5 < rz < 1.0:
+                    out.append((rx, ry))
         if not out:
             return None
         return np.array(out), t_ref
@@ -319,9 +477,16 @@ def straighten_angle(xy, res=0.05):
     return math.radians(best_a)
 
 
-def declutter(occ, min_neighbors=4, min_blob=15):
+def declutter(occ, min_neighbors=3, min_blob=15):
     """Drop the path trail: thin 1-px streaks and isolated specks left by the
-    rig's trajectory / sparse reflections, keeping solid wall structure."""
+    rig's trajectory / sparse reflections, keeping solid wall structure.
+
+    min_neighbors counts the cell + its 8-neighbours: 1=lone speck, 2=a pair,
+    3=an interior pixel of a straight 1-px line. Keep >=3 so genuine thin walls
+    (a far/grazing wall that only painted a single-pixel line) survive; the
+    connected-component min_blob then removes the short scattered runs that a
+    4-cull would have caught. (A 4-cull erodes every 1-px wall, which deleted
+    real short wall segments.)"""
     from scipy.ndimage import convolve, label
     cnt = convolve(occ.astype(np.int32), np.ones((3, 3), np.int32), mode="constant")
     occ = occ & (cnt >= min_neighbors)
@@ -380,18 +545,32 @@ def render(poses, scans, out_png, res=0.025, hits=2, title="Floorplan",
     H = int((ys.max() - mny) / res) + 1
     grid = np.zeros((H, W), np.int32)
     np.add.at(grid, (((ys - mny) / res).astype(int), ((xs - mnx) / res).astype(int)), 1)
-    occ = grid >= hits
+    # Hysteresis threshold: a faint/grazing wall paints a sparse line of mostly
+    # 1-hit cells with only a few >= hits cells, which a flat `grid >= hits` cull
+    # guts (and declutter then finishes off). Instead keep every >=1-hit cell
+    # whose connected blob contains at least one strong (>= hits) cell -- the
+    # faint parts of a real wall are recovered, but isolated 1-hit specks (no
+    # strong evidence anywhere in their blob) are still dropped.
+    if hits > 1:
+        from scipy.ndimage import label as _label
+        lab, n = _label(grid >= 1)
+        keep = np.zeros(n + 1, bool)
+        keep[np.unique(lab[grid >= hits])] = True
+        keep[0] = False
+        occ = keep[lab]
+    else:
+        occ = grid >= hits
+
     if clean:
         occ = declutter(occ)
+        
     if thin:
-        # collapse the drift-thickened wall bands to single-pixel centerlines,
-        # so walls look as thin as in one scan frame. Close first to consolidate
-        # the rough/holey bands, otherwise the skeleton comes out beaded.
         from skimage.morphology import skeletonize
         from scipy.ndimage import binary_closing
         occ = binary_closing(occ, np.ones((3, 3), bool), iterations=2)
         occ = skeletonize(occ)
         occ = prune_spurs(occ, min_len=int(round(0.25 / res)))
+
     # crop to the occupied content (+ small margin) so the corner is well defined
     rows, cols = np.any(occ, axis=1), np.any(occ, axis=0)
     if rows.any() and cols.any():
@@ -442,23 +621,38 @@ def main():
                     help="thin walls to single-pixel centerlines (like one scan frame)")
     ap.add_argument("--keep-operator", action="store_true",
                     help="do not strip the operator (close fixed-bearing returns)")
-    ap.add_argument("--self-range", type=float, default=1.0,
-                    help="operator strip max range in metres (default 1.0; the body sits "
+    ap.add_argument("--self-range", type=float, default=1.1,
+                    help="operator strip max range in metres (default 1.1; the body sits "
                          "at 0.3-0.8 m, so walls beyond ~1 m are kept)")
+    ap.add_argument("--self-frac", type=float, default=0.5,
+                    help="operator persistence: blank a bearing held near in more than this "
+                         "fraction of revolutions (default 0.5; lower = strip more aggressively)")
     ap.add_argument("--self-ang", default="",
                     help="force operator sector 'lo,hi' deg (wrap-aware) instead of auto-detect")
+    ap.add_argument("--no-kf", action="store_true",
+                    help="use the fixed-gain complementary filter for tilt instead of the "
+                         "motion-adaptive Kalman filter (default)")
+    ap.add_argument("--kf-gate", type=float, default=0.03,
+                    help="Kalman accel-trust gate: |a|-vs-1g deviation (fraction of g) at "
+                         "which the tilt measurement noise doubles (default 0.03, tuned on scan_006)")
     args = ap.parse_args()
 
     out = args.output or args.input.rsplit(".", 1)[0] + "_floorplan.png"
 
-    packets, imu_ns, imu_wz = load_ldim(args.input)
+    packets, imu_ns, imu_wz, imu_data = load_ldim(args.input)
     print(f"{len(packets)} LD19 packets, {len(imu_ns)} IMU samples, "
           f"{(packets[-1][0] - packets[0][0]) / 1e9:.1f}s")
     if not args.keep_operator:
         sector = tuple(float(v) for v in args.self_ang.split(",")) if args.self_ang else None
-        packets = strip_operator(packets, rng=args.self_range, sector=sector)
-    yaw_at = build_yaw(imu_ns, imu_wz)
-    scans, times = assemble_scans(packets, yaw_at)
+        packets = strip_operator(packets, rng=args.self_range, frac=args.self_frac, sector=sector)
+    if args.no_kf:
+        get_rot = build_orientation(imu_data)
+        print("tilt: fixed-gain complementary filter")
+    else:
+        get_rot = build_orientation_kf(imu_data, gate=args.kf_gate)
+        print(f"tilt: motion-adaptive Kalman filter (gate={args.kf_gate})")
+    yaw_at = lambda t: get_rot(t)[2]
+    scans, times = assemble_scans(packets, get_rot)
     print(f"{len(scans)} deskewed scans")
 
     poses = run_slam(scans, times, yaw_at, win=args.window)
