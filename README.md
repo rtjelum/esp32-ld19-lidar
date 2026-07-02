@@ -110,7 +110,7 @@ make pull-recordings          # download new .ldim from the device into recordin
 make list-recordings          # list what's on the device (no download)
 make clear-device             # wipe all recordings on the device (skips the active one)
 make clear-recordings         # delete local recordings + derived .mcap/.png
-make floorplan                # gyro-deskew + ICP + loop-closure floorplan PNG
+make floorplan                # deskew + point-to-line ICP + loop-closure floorplan PNG
 make viz                      # interactive PRBonn lidar-visualizer (auto-builds MCAP)
 make mcap                     # just convert .ldim -> MCAP
 make view                     # quick static matplotlib scatter
@@ -124,7 +124,7 @@ All processing targets default to the newest recording; override with `LDIM=reco
 
 <img src="floorplan_sample.png" alt="Sample floorplan" width="350">
 
-*Floorplan from a ~50 s handheld walk (`make floorplan`): gyro deskew + ICP + loop closure.*
+*Floorplan from a ~50 s handheld walk (`make floorplan`): gyro + translation deskew, point-to-line ICP, loop closure, global refinement.*
 
 Recordings can also be managed over a 115200-baud serial console: `ls` (list), `rm <file>`, `i2c` (scan both buses for the touch/IMU controllers).
 

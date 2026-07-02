@@ -18,6 +18,23 @@ two things that wreck a naive overlay of the raw scans:
      across the trajectory, weighted by how much the rig was moving/turning at
      each step.
 
+  On top of that, three registration upgrades (each with an opt-out flag):
+
+  3. Point-to-line ICP (--p2p reverts). Walls are lines; minimising distance to
+     the local wall *line* (normals from neighbourhood PCA, Huber-weighted)
+     converges tighter and faster than point-to-point on indoor scans.
+
+  4. Translation deskew (--no-deskew-xy reverts). The gyro deskew only handles
+     rotation; at walking pace the rig also moves ~10 cm per revolution, which
+     rigid per-scan ICP cannot remove. A second pass re-assembles the scans
+     shifting every point by the (first-pass SLAM) trajectory displacement
+     between its timestamp and the scan reference time, then re-runs SLAM.
+
+  5. Global refinement (--no-refine reverts). After loop closure, every scan is
+     re-registered point-to-line against the consensus map of temporally
+     distant scans for a couple of sweeps, tightening any wall doubling the
+     single end-to-start closure and its heuristic distribution left behind.
+
 Usage:
   tools/.venv/bin/python tools/ldim_to_floorplan.py recordings/scan_003.ldim
   tools/.venv/bin/python tools/ldim_to_floorplan.py recordings/scan_003.ldim \
@@ -308,11 +325,16 @@ def rotate_3d(x, y, z, roll, pitch, yaw):
     return x, y, z
 
 
-def assemble_scans(packets, get_rot, rng=(0.25, 12.0), min_pts=50):
+def assemble_scans(packets, get_rot, rng=(0.25, 12.0), min_pts=50, world_pose=None):
     # rng[0] is a global near floor: nothing real sits within 0.25 m of a
     # handheld scanner, so this mops up point-blank clutter (a hand, or the
     # operator's setup pose at the start) that the sensor-frame persistence
     # strip can't catch because it only occupies that bearing for a moment.
+    #
+    # world_pose (optional): t_ns -> (x, y, world_yaw) trajectory from a prior
+    # SLAM pass. When given, each point is also *translation*-deskewed: the rig
+    # walks up to ~10 cm during one revolution, and the gyro-only deskew leaves
+    # that as per-scan smear that rigid ICP cannot remove.
     scans, times, cur, last_a0 = [], [], [], -1.0
     PKT_NS = 3.33e6
 
@@ -321,6 +343,9 @@ def assemble_scans(packets, get_rot, rng=(0.25, 12.0), min_pts=50):
             return None
         t_ref = group[len(group) // 2][0]
         r_ref, p_ref, y_ref = get_rot(t_ref)
+        if world_pose is not None:
+            x_ref, yy_ref, yw_ref = world_pose(t_ref)
+            cw, sw = math.cos(yw_ref), math.sin(yw_ref)
         out = []
         for (t_ns, a0, a1, pts) in group:
             span = a1 - a0
@@ -336,6 +361,13 @@ def assemble_scans(packets, get_rot, rng=(0.25, 12.0), min_pts=50):
                 d_m = d / 1000.0
                 lx, ly, lz = -math.sin(ang) * d_m, math.cos(ang) * d_m, 0.0
                 rx, ry, rz = rotate_3d(lx, ly, lz, r, p, dy)
+                if world_pose is not None:
+                    # shift by the rig's motion between t_pt and t_ref, rotated
+                    # into the scan's reference body frame
+                    xw, yw, _ = world_pose(t_pt)
+                    dxw, dyw = xw - x_ref, yw - yy_ref
+                    rx += cw * dxw + sw * dyw
+                    ry += -sw * dxw + cw * dyw
                 if -0.5 < rz < 1.0:
                     out.append((rx, ry))
         if not out:
@@ -363,7 +395,52 @@ def assemble_scans(packets, get_rot, rng=(0.25, 12.0), min_pts=50):
     return kept_s, kept_t
 
 
+def redeskew_translation(packets, get_rot, poses, times):
+    """Re-assemble the scans with translation deskew, using the trajectory from
+    a first SLAM pass. At walking pace the rig moves ~10 cm per LD19 revolution;
+    the first pass treats each revolution as rigid, so every scan carries that
+    much smear. Interpolate the first-pass poses (lightly smoothed — ICP jitter
+    would otherwise leak into per-point corrections) and shift each point by the
+    rig displacement between its own timestamp and the scan reference time.
+    Returns (scans, times) for a second SLAM pass."""
+    ts = np.array(times, float)
+    xs = np.array([P[0, 2] for P in poses])
+    ys = np.array([P[1, 2] for P in poses])
+    yw = np.unwrap([yaw_of(P) for P in poses])
+    if len(ts) >= 3:
+        k = np.array([0.25, 0.5, 0.25])
+        xs = np.convolve(np.pad(xs, 1, mode="edge"), k, mode="valid")
+        ys = np.convolve(np.pad(ys, 1, mode="edge"), k, mode="valid")
+
+    def world_pose(t):
+        return (float(np.interp(t, ts, xs)), float(np.interp(t, ts, ys)),
+                float(np.interp(t, ts, yw)))
+
+    return assemble_scans(packets, get_rot, world_pose=world_pose)
+
+
 # --- ICP ------------------------------------------------------------------
+
+PLICP_DEFAULT = True  # scan matching is point-to-line unless --p2p
+
+
+def estimate_normals(pts, k=10):
+    """Per-point unit normals from the PCA of the k nearest neighbours.
+    Indoor 2D scans are mostly wall segments, so the minor axis of the local
+    neighbourhood is the wall normal. Sign is arbitrary (the point-to-line
+    residual is squared, so it doesn't matter)."""
+    k = min(k, len(pts))
+    kd = cKDTree(pts)
+    _, idx = kd.query(pts, k=k)
+    nb = pts[idx]                       # (n, k, 2)
+    nb = nb - nb.mean(axis=1, keepdims=True)
+    # 2x2 covariance per point: [[a, b], [b, c]]
+    a = np.einsum("nk,nk->n", nb[:, :, 0], nb[:, :, 0])
+    b = np.einsum("nk,nk->n", nb[:, :, 0], nb[:, :, 1])
+    c = np.einsum("nk,nk->n", nb[:, :, 1], nb[:, :, 1])
+    phi = 0.5 * np.arctan2(2 * b, a - c)   # major-axis angle
+    return np.column_stack([-np.sin(phi), np.cos(phi)])
+
 
 def voxel(p, leaf):
     if len(p) == 0:
@@ -405,13 +482,53 @@ def _icp_pass(src, kd, tgt, M, iters, max_dist, trim):
     return M
 
 
-def icp(src, tgt, M0, schedule):
+def solve_p2l(sp, tp, nrm):
+    """One Gauss-Newton step of point-to-line alignment: find (dx, dy, dtheta)
+    minimising sum of huber(n . (R p + t - q)) over correspondences, linearised
+    at the identity. Returns the 3x3 increment matrix."""
+    r = np.einsum("ni,ni->n", sp - tp, nrm)
+    # Huber weights: quadratic core, linear tail (scale from the residual MAD)
+    s = 1.4826 * np.median(np.abs(r)) + 1e-6
+    w = np.where(np.abs(r) <= 1.5 * s, 1.0, 1.5 * s / np.abs(r))
+    J = np.column_stack([nrm[:, 0], nrm[:, 1],
+                         nrm[:, 1] * sp[:, 0] - nrm[:, 0] * sp[:, 1]])
+    A = (J * w[:, None]).T @ J
+    b = (J * w[:, None]).T @ r
+    A += np.eye(3) * (1e-9 + 1e-6 * np.trace(A) / 3)   # corridor degeneracy guard
+    try:
+        dx, dy, dth = np.linalg.solve(A, -b)
+    except np.linalg.LinAlgError:
+        return np.eye(3)
+    return mat(dx, dy, dth)
+
+
+def _icp_pass_p2l(src, kd, tgt, nrm, M, iters, max_dist, trim):
+    for _ in range(iters):
+        T = apply(M, src)
+        d, idx = kd.query(T, distance_upper_bound=max_dist)
+        ok = np.isfinite(d)
+        if ok.sum() < 10:
+            break
+        ok &= d <= np.percentile(d[ok], trim * 100)
+        dM = solve_p2l(T[ok], tgt[idx[ok]], nrm[idx[ok]])
+        M = dM @ M
+        if abs(dM[0, 2]) + abs(dM[1, 2]) < 1e-5 and abs(yaw_of(dM)) < 1e-5:
+            break
+    return M
+
+
+def icp(src, tgt, M0, schedule, point_to_line=PLICP_DEFAULT):
     if len(src) < 10 or len(tgt) < 10:
         return M0
     kd = cKDTree(tgt)
     M = M0
-    for step in schedule:
-        M = _icp_pass(src, kd, tgt, M, *step)
+    if point_to_line:
+        nrm = estimate_normals(tgt)
+        for step in schedule:
+            M = _icp_pass_p2l(src, kd, tgt, nrm, M, *step)
+    else:
+        for step in schedule:
+            M = _icp_pass(src, kd, tgt, M, *step)
     return M
 
 
@@ -421,7 +538,8 @@ def yaw_of(M):
 
 # --- SLAM + loop closure --------------------------------------------------
 
-def run_slam(scans, times, yaw_at, win=50, voxel_map=0.03, voxel_src=0.04):
+def run_slam(scans, times, yaw_at, win=50, voxel_map=0.03, voxel_src=0.04,
+             point_to_line=PLICP_DEFAULT):
     poses = [mat(0, 0, 0)]
     recent = [apply(poses[0], scans[0])]
     for i in range(1, len(scans)):
@@ -430,20 +548,21 @@ def run_slam(scans, times, yaw_at, win=50, voxel_map=0.03, voxel_src=0.04):
         M0 = mat(px, py, yaw_of(poses[-1]) + dyaw)
         local = voxel(np.vstack(recent[-win:]), voxel_map)
         M = icp(voxel(scans[i], voxel_src), local, M0,
-                [(30, 0.4, 0.85), (25, 0.15, 0.92)])
+                [(30, 0.4, 0.85), (25, 0.15, 0.92)], point_to_line=point_to_line)
         poses.append(M)
         recent.append(apply(M, scans[i]))
     return poses
 
 
-def close_loop(poses, scans, k=45, leaf=0.025):
+def close_loop(poses, scans, k=45, leaf=0.025, point_to_line=PLICP_DEFAULT):
     N = len(poses)
     if N < 2 * k:
         return poses, None
     start_ref = voxel(np.vstack([apply(poses[j], scans[j]) for j in range(k)]), leaf)
     end_glob = voxel(np.vstack([apply(poses[j], scans[j]) for j in range(N - k, N)]), leaf)
     C = icp(end_glob, start_ref, np.eye(3),
-            [(60, 2.0, 0.9), (50, 0.7, 0.92), (40, 0.25, 0.95)])
+            [(60, 2.0, 0.9), (50, 0.7, 0.92), (40, 0.25, 0.95)],
+            point_to_line=point_to_line)
     # weight correction by per-step motion (drift concentrates where it moves)
     trans = [0.0] + [np.hypot(poses[i][0, 2] - poses[i - 1][0, 2],
                               poses[i][1, 2] - poses[i - 1][1, 2]) for i in range(1, N)]
@@ -454,6 +573,49 @@ def close_loop(poses, scans, k=45, leaf=0.025):
     f = f / f[-1] if f[-1] > 0 else f
     logC = logm(C).real
     return [expm(f[i] * logC) @ poses[i] for i in range(N)], C
+
+
+def refine_poses(poses, scans, sweeps=2, max_dist=0.15, excl=8, k=12):
+    """Global map relaxation: re-register every scan against the consensus map
+    of all *temporally distant* scans (|index gap| > excl) and apply the
+    point-to-line correction, for a few Jacobi sweeps.
+
+    The single end-to-start loop closure only pins the two ends of the
+    trajectory; drift picked up and partially cancelled mid-walk (and the
+    motion-weighted heuristic that spreads the closure) leaves walls doubled by
+    a few cm where the path revisits a region. Pulling each scan onto the
+    consensus of scans taken at a different time tightens exactly that, without
+    letting a scan "agree with itself" via its immediate neighbours."""
+    N = len(scans)
+    poses = [P.copy() for P in poses]
+    for sweep in range(sweeps):
+        world = [apply(P, s) for P, s in zip(poses, scans)]
+        pts = np.vstack(world)
+        sid = np.concatenate([np.full(len(w), i) for i, w in enumerate(world)])
+        kd = cKDTree(pts)
+        nrm = estimate_normals(pts, k=10)
+        moved = 0.0
+        for i in range(N):
+            src = world[i]
+            d, idx = kd.query(src, k=k, distance_upper_bound=max_dist)
+            tgt = np.full(len(src), -1)
+            for col in range(k):
+                ok = np.isfinite(d[:, col]) & (tgt < 0)
+                if not ok.any():
+                    continue
+                far = np.zeros(len(src), bool)
+                far[ok] = np.abs(sid[idx[ok, col]] - i) > excl
+                sel = ok & far
+                tgt[sel] = idx[sel, col]
+            m = tgt >= 0
+            if m.sum() < 30:
+                continue
+            dM = solve_p2l(src[m], pts[tgt[m]], nrm[tgt[m]])
+            poses[i] = dM @ poses[i]
+            moved += math.hypot(dM[0, 2], dM[1, 2])
+        print(f"refine sweep {sweep + 1}/{sweeps}: mean correction "
+              f"{moved / N * 100:.2f} cm")
+    return poses
 
 
 # --- render ---------------------------------------------------------------
@@ -635,6 +797,12 @@ def main():
     ap.add_argument("--kf-gate", type=float, default=0.03,
                     help="Kalman accel-trust gate: |a|-vs-1g deviation (fraction of g) at "
                          "which the tilt measurement noise doubles (default 0.03, tuned on scan_006)")
+    ap.add_argument("--p2p", action="store_true",
+                    help="classic point-to-point ICP instead of point-to-line (default)")
+    ap.add_argument("--no-deskew-xy", action="store_true",
+                    help="skip the second-pass translation deskew of each revolution")
+    ap.add_argument("--no-refine", action="store_true",
+                    help="skip the post-loop global map refinement sweeps")
     args = ap.parse_args()
 
     out = args.output or args.input.rsplit(".", 1)[0] + "_floorplan.png"
@@ -652,17 +820,26 @@ def main():
         get_rot = build_orientation_kf(imu_data, gate=args.kf_gate)
         print(f"tilt: motion-adaptive Kalman filter (gate={args.kf_gate})")
     yaw_at = lambda t: get_rot(t)[2]
+    p2l = not args.p2p
     scans, times = assemble_scans(packets, get_rot)
     print(f"{len(scans)} deskewed scans")
 
-    poses = run_slam(scans, times, yaw_at, win=args.window)
+    poses = run_slam(scans, times, yaw_at, win=args.window, point_to_line=p2l)
     print(f"forward SLAM net yaw: {math.degrees(yaw_of(poses[-1])):.1f} deg")
 
+    if not args.no_deskew_xy:
+        scans, times = redeskew_translation(packets, get_rot, poses, times)
+        poses = run_slam(scans, times, yaw_at, win=args.window, point_to_line=p2l)
+        print("translation deskew: re-assembled scans from first-pass trajectory")
+
     if not args.no_loop:
-        poses, C = close_loop(poses, scans)
+        poses, C = close_loop(poses, scans, point_to_line=p2l)
         if C is not None:
             print(f"loop closure: dx={C[0,2]:+.3f} dy={C[1,2]:+.3f} "
                   f"dtheta={math.degrees(yaw_of(C)):+.2f} deg")
+
+    if not args.no_refine:
+        poses = refine_poses(poses, scans)
 
     render(poses, scans, out, res=args.res, hits=args.hits,
            mirror=not args.no_mirror, straighten=not args.no_straighten,

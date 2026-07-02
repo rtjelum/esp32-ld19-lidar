@@ -115,7 +115,8 @@ dump:
 view: venv
 	$(PY) tools/view_ldim.py $(LDIM)
 
-# Build a floorplan PNG from a recording (gyro deskew + ICP + loop closure).
+# Build a floorplan PNG from a recording (gyro + translation deskew,
+# point-to-line ICP, loop closure, global refinement).
 floorplan: venv
 	$(PY) tools/ldim_to_floorplan.py $(LDIM)
 
