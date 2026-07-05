@@ -111,6 +111,7 @@ make list-recordings          # list what's on the device (no download)
 make clear-device             # wipe all recordings on the device (skips the active one)
 make clear-recordings         # delete local recordings + derived .mcap/.png
 make floorplan                # deskew + point-to-line ICP + loop-closure floorplan PNG
+make path                     # position-path PNG (SLAM trajectory over a faint map)
 make viz                      # interactive PRBonn lidar-visualizer (auto-builds MCAP)
 make mcap                     # just convert .ldim -> MCAP
 make view                     # quick static matplotlib scatter
@@ -120,13 +121,42 @@ make help                     # list every make target
 
 All processing targets default to the newest recording; override with `LDIM=recordings/scan_002.ldim`, and the device host with `HOST=lidar.local`. The Python venv (`tools/.venv`) is created automatically and **pins Python 3.13** (the visualizer / `rosbags` lack wheels for 3.14). `make viz` clones [PRBonn/lidar-visualizer](https://github.com/PRBonn/lidar-visualizer) on demand.
 
-`make gui` (`lidar_gui.py`) is a Tkinter front-end for all of the above: pull/clear recordings, browse local `.ldim` files, run the 2D/3D visualizers and floorplan builder on the selected file, and compile/flash the firmware, with live command output in a log pane. It is stdlib-only and shells out to these same make targets, so it needs Python 3.13 (the system `python3` ships without tkinter).
+<img src="floorplan_sample.png" alt="Sample floorplan" width="350"> <img src="path_sample.png" alt="Sample position path" width="390">
 
-<img src="floorplan_sample.png" alt="Sample floorplan" width="350">
-
-*Floorplan from a ~50 s handheld walk (`make floorplan`): gyro + translation deskew, point-to-line ICP, loop closure, global refinement.*
+*From the same ~50 s handheld walk: the floorplan (`make floorplan` — gyro + translation deskew, point-to-line ICP, loop closure, global refinement) and the rig's position path over the same map (`make path` — light→dark blue with time).*
 
 Recordings can also be managed over a 115200-baud serial console: `ls` (list), `rm <file>`, `i2c` (scan both buses for the touch/IMU controllers).
+
+### Desktop GUI
+
+```bash
+make gui        # or: python3.13 lidar_gui.py
+```
+
+`lidar_gui.py` is a Tkinter control panel wrapping every make target above. It is stdlib-only but needs **Python 3.13** (the system `python3` ships without tkinter); the tools venv is built automatically the first time an action needs it.
+
+<img src="gui_control.png" alt="GUI Control tab" width="600">
+
+*The Control tab: device access, local recordings, per-recording actions, firmware, and the live output log.*
+
+The window has two tabs plus a shared **Output** pane at the bottom that streams the live output of the running command — one command runs at a time, and **Stop** kills it.
+
+**Control tab**
+
+- **Device** — set the host (default `lidar.local`). **Check** shows the device's file count, free flash, and whether it is recording; **Pull recordings** downloads new `.ldim` files into `recordings/`; **Clear device** wipes the device (the file currently being recorded is skipped).
+- **Local recordings** — lists `recordings/*.ldim` with the newest pre-selected; **Refresh** rescans, **Open folder** opens it in Finder.
+- **Selected recording** — runs a tool on the highlighted file:
+  - **Info** — duration + LD19/IMU sample counts (`make dump`)
+  - **Floorplan PNG** — SLAM floorplan (`make floorplan`)
+  - **Path PNG** — the rig's position path over a faint point map (`make path`)
+  - **Viz Raw / Viz Stabilized / Viz 3D merge** — the interactive 3-D viewers (`make viz` / `viz3d` / `viz3d-merge`)
+- **Local + firmware** — delete local recordings and their derived files, compile the firmware, or flash it over USB.
+
+**PNG Viewer tab** — browses the PNGs under `recordings/`, scaled to fit the window; **Open externally** hands the file to Preview. The two PNG-producing buttons (Floorplan, Path) switch to this tab automatically when they finish.
+
+<img src="gui_viewer.png" alt="GUI PNG Viewer tab" width="600">
+
+*The PNG Viewer tab showing a position-path render.*
 
 ### Enclosure Design
 The 3D-printable box is generated using a Python script that leverages geometric libraries.
