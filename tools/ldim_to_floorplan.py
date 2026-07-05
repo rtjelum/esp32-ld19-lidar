@@ -763,6 +763,80 @@ def render(poses, scans, out_png, res=0.025, hits=2, title="Floorplan",
     plt.close()
 
 
+def render_path(poses, scans, times, out_png, title="Position path",
+                mirror=True, straighten=True):
+    """Render the rig's position path (the SLAM trajectory) over a faint point
+    map. Uses the same mirror/straighten transform as render(), so the path
+    lines up with the floorplan PNG of the same recording. The path is a single
+    blue ramp, light (start) to dark (end); a colorbar maps shade to seconds,
+    and start/end carry text labels so the direction is readable without it."""
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.ticker import MultipleLocator
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    allp = np.vstack([apply(P, s) for P, s in zip(poses, scans)])
+    xs, ys = allp[:, 0], allp[:, 1]
+    px = np.array([P[0, 2] for P in poses])
+    py = np.array([P[1, 2] for P in poses])
+    if mirror:
+        xs, px = -xs, -px
+    if straighten:
+        a = straighten_angle(np.column_stack([xs, ys]))
+        c, s = math.cos(a), math.sin(a)
+        xs, ys = xs * c - ys * s, xs * s + ys * c
+        px, py = px * c - py * s, px * s + py * c
+        print(f"straighten: rotated map by {math.degrees(a):.1f} deg")
+
+    t = (np.array(times, float) - times[0]) / 1e9
+    length = float(np.hypot(np.diff(px), np.diff(py)).sum())
+
+    fig = plt.figure(figsize=(12, 12))
+    ax = plt.gca()
+    ax.scatter(xs, ys, s=0.5, c="#c3c2b7", linewidths=0, rasterized=True)
+    pts = np.column_stack([px, py])
+    segs = np.stack([pts[:-1], pts[1:]], axis=1)
+    # single-hue sequential ramp (light = start, dark = end); lightest step
+    # still reads against the white map surface
+    cmap = LinearSegmentedColormap.from_list(
+        "seqblue", ["#86b6ef", "#3987e5", "#1c5cab", "#0d366b"])
+    lc = LineCollection(segs, cmap=cmap, norm=Normalize(0.0, t[-1] or 1.0),
+                        array=t[:-1], linewidths=2, capstyle="round")
+    ax.add_collection(lc)
+    ax.plot(px[0], py[0], "o", ms=9, mfc="#86b6ef", mec="#0d366b", mew=1.2)
+    ax.plot(px[-1], py[-1], "o", ms=9, mfc="#0d366b", mec="#0d366b")
+    # opposite offsets: the capture usually starts and ends in the same place,
+    # so same-side labels would sit on top of each other
+    for x, y, lbl, dx, dy in ((px[0], py[0], "start", 10, -14),
+                              (px[-1], py[-1], "end", 10, 10)):
+        ax.annotate(lbl, (x, y), xytext=(dx, dy), textcoords="offset points",
+                    fontsize=9, color="#0b0b0b",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                              ec="#c3c2b7", lw=0.5, alpha=0.85))
+    # clip stray speckle so the view frames the room, not the outliers
+    x0, x1 = np.percentile(xs, [1, 99]); y0, y1 = np.percentile(ys, [1, 99])
+    ax.set_xlim(min(x0, px.min()) - 0.75, max(x1, px.max()) + 0.75)
+    ax.set_ylim(min(y0, py.min()) - 0.75, max(y1, py.max()) + 0.75)
+    # divider-appended axes track the equal-aspect plot height, so the colorbar
+    # stays the same height as the map instead of the full figure
+    cax = make_axes_locatable(ax).append_axes("right", size="3%", pad=0.15)
+    cbar = fig.colorbar(lc, cax=cax)
+    cbar.set_label("time (s)", fontsize=9)
+    cbar.ax.tick_params(labelsize=7)
+
+    ax.set_aspect("equal")
+    ax.xaxis.set_major_locator(MultipleLocator(0.5))
+    ax.yaxis.set_major_locator(MultipleLocator(0.5))
+    ax.tick_params(labelsize=7)
+    plt.setp(ax.get_xticklabels(), rotation=90)
+    ax.grid(True, which="major", linewidth=0.3, color="0.8")
+    ax.set_title(f"{title}  ({length:.1f} m, {t[-1]:.0f} s)")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    plt.savefig(out_png, dpi=130, bbox_inches="tight")
+    plt.close()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -803,9 +877,13 @@ def main():
                     help="skip the second-pass translation deskew of each revolution")
     ap.add_argument("--no-refine", action="store_true",
                     help="skip the post-loop global map refinement sweeps")
+    ap.add_argument("--path", action="store_true",
+                    help="render the rig's position path (SLAM trajectory) over a faint "
+                         "point map instead of the floorplan")
     args = ap.parse_args()
 
-    out = args.output or args.input.rsplit(".", 1)[0] + "_floorplan.png"
+    suffix = "_path.png" if args.path else "_floorplan.png"
+    out = args.output or args.input.rsplit(".", 1)[0] + suffix
 
     packets, imu_ns, imu_wz, imu_data = load_ldim(args.input)
     print(f"{len(packets)} LD19 packets, {len(imu_ns)} IMU samples, "
@@ -841,10 +919,15 @@ def main():
     if not args.no_refine:
         poses = refine_poses(poses, scans)
 
-    render(poses, scans, out, res=args.res, hits=args.hits,
-           mirror=not args.no_mirror, straighten=not args.no_straighten,
-           clean=not args.keep_trail, thin=args.thin,
-           title=f"Floorplan — {args.input}")
+    if args.path:
+        render_path(poses, scans, times, out,
+                    mirror=not args.no_mirror, straighten=not args.no_straighten,
+                    title=f"Position path — {args.input}")
+    else:
+        render(poses, scans, out, res=args.res, hits=args.hits,
+               mirror=not args.no_mirror, straighten=not args.no_straighten,
+               clean=not args.keep_trail, thin=args.thin,
+               title=f"Floorplan — {args.input}")
     print(f"wrote {out}")
 
 

@@ -30,7 +30,7 @@ SKIP_MERGE = --build-property "recipe.hooks.objcopy.postobjcopy.3.pattern=/usr/b
 .PHONY: all help gui compile compile-full flash verify bootloader clean list \
         touch-compile touch-flash venv pull-recordings list-recordings \
         clear-recordings clear-device dump \
-        view floorplan mcap viz viz3d viz3d-static viz3d-merge
+        view floorplan path mcap viz viz3d viz3d-static viz3d-merge
 
 all: compile flash
 
@@ -119,6 +119,12 @@ view: venv
 # point-to-line ICP, loop closure, global refinement).
 floorplan: venv
 	$(PY) tools/ldim_to_floorplan.py $(LDIM)
+
+# Render the rig's position path (SLAM trajectory over a faint point map) to a
+# PNG. Same pipeline as `floorplan`, different render. (Kept .PHONY: a stray
+# path/ directory exists in the repo root.)
+path: venv
+	$(PY) tools/ldim_to_floorplan.py $(LDIM) --path
 
 # Convert a .ldim to an MCAP (LaserScan + PointCloud2 + Imu) for the visualizer.
 mcap: venv

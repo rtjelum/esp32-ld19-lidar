@@ -61,10 +61,14 @@ def fetch_device_status(host, timeout=5):
 RECORDING_ACTIONS = [
     ("Info",          "dump",         "Duration + LD19/IMU sample counts"),
     ("Floorplan PNG", "floorplan",    "Deskew + ICP + loop closure; shows in PNG Viewer tab"),
+    ("Path PNG",      "path",         "IMU+SLAM position path; shows in PNG Viewer tab"),
     ("Viz Raw",        "viz",          "Interactive PRBonn visualizer"),
     ("Viz Stabilized",        "viz3d",        "Tilt-compensated frame sequence"),
     ("Viz 3D merge",  "viz3d-merge",  "6-DoF drift-corrected merge (handheld)"),
 ]
+
+# Targets that write <recording>_<suffix>.png; the GUI opens it when they finish.
+PNG_TARGETS = {"floorplan": "_floorplan.png", "path": "_path.png"}
 
 
 class App:
@@ -377,17 +381,18 @@ class App:
             messagebox.showinfo("No recording", "Select a recording first.")
             return
         on_done = None
-        if target.startswith("floorplan"):
-            png = ROOT / (ldim.rsplit(".", 1)[0] + "_floorplan.png")
+        suffix = PNG_TARGETS.get(target)
+        if suffix:
+            png = ROOT / (ldim.rsplit(".", 1)[0] + suffix)
             on_done = lambda code, p=png: self._show_png(code, p)
         self.run(build_make_cmd(target, ldim=ldim), on_done=on_done)
 
     def _show_png(self, code, path):
-        """Show the floorplan PNG in the PNG Viewer tab once the build succeeds."""
+        """Show the produced PNG in the PNG Viewer tab once the build succeeds."""
         if code != 0:
             return
         if not path.exists():
-            self.log(f"(floorplan finished but {path.name} not found)\n", "err")
+            self.log(f"(command finished but {path.name} not found)\n", "err")
             return
         self.refresh_pngs()
         self.png_var.set(path.name)
