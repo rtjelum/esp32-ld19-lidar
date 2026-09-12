@@ -43,7 +43,7 @@ help:
 # (the system python3 ships without tkinter); the GUI itself is stdlib-only and
 # shells out to these make targets, building the venv on demand.
 gui:
-	$(PYTHON3) lidar_gui.py
+	.venv/bin/python lidar_gui.py
 
 compile:
 	arduino-cli compile --fqbn $(FQBN) --build-path $(BUILD_DIR) $(SKIP_MERGE) $(CURDIR)
