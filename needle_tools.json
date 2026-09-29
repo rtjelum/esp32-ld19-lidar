@@ -1,0 +1,87 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "start_gui",
+      "description": "Start the main Lidar Desktop Control Panel (Tkinter GUI).",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    "x-exec": {
+      "run": ["make", "gui"],
+      "mode": "background",
+      "status": "Lidar GUI launched."
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "process_recording",
+      "description": "Process a local .ldim recording file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Must be exactly one of: 'dump' (show info/stats), 'floorplan' (generate 2D floorplan PNG), 'path' (generate path/trajectory PNG), 'view' (quick matplotlib scatter plot), 'viz' (interactive PRBonn visualizer, auto-converts to mcap), 'viz3d' (tilt-stabilized 3D visualizer), 'viz3d-static' (merged static 3D scan for tripod recordings), 'viz3d-merge' (6-DoF drift-corrected 3D merge for handheld recordings), or 'mcap' (convert to mcap format)."
+          },
+          "filename": {
+            "type": "string",
+            "description": "The scan base name only (e.g. 'scan_006'). No directory, no extension, no action prefix."
+          }
+        },
+        "required": [
+          "action",
+          "filename"
+        ]
+      }
+    },
+    "x-exec": {
+      "resolve": {"filename": "ldim"},
+      "switch": "action",
+      "defaults": {"run": ["make", "{action}", "LDIM={filename}"]},
+      "cases": {
+        "dump":         {"mode": "capture", "timeout": 120},
+        "mcap":         {"mode": "capture", "timeout": 120},
+        "floorplan":    {"mode": "capture", "timeout": 120, "open": "{stem}_floorplan.png", "status": "Generated and opened {open}!"},
+        "path":         {"mode": "capture", "timeout": 120, "open": "{stem}_path.png",      "status": "Generated and opened {open}!"},
+        "view":         {"mode": "background", "status": "Launched view for {filename}. Window should appear shortly."},
+        "viz":          {"mode": "background", "status": "Launched viz for {filename}. Window should appear shortly."},
+        "viz3d":        {"mode": "background", "status": "Launched viz3d for {filename}. Window should appear shortly."},
+        "viz3d-static": {"mode": "background", "status": "Launched viz3d-static for {filename}. Window should appear shortly."},
+        "viz3d-merge":  {"mode": "background", "status": "Launched viz3d-merge for {filename}. Window should appear shortly."}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "build_firmware",
+      "description": "Build the ESP32 firmware with arduino-cli via the Makefile.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Must be exactly one of: 'compile' (compile only, produces build/), 'all' (compile then flash to the connected board over serial), or 'clean' (remove build/ for a from-scratch rebuild)."
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    "x-exec": {
+      "switch": "action",
+      "defaults": {"run": ["make", "{action}"], "mode": "stream", "timeout": 300},
+      "cases": {
+        "compile": {"status": "Firmware compiled successfully."},
+        "all":     {"status": "Firmware compiled and flashed successfully.", "timeout": 600},
+        "clean":   {"status": "Firmware cleaned successfully."}
+      }
+    }
+  }
+]
