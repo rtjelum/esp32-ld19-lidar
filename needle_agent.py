@@ -6,9 +6,17 @@ Tool schemas and their call tree both live in needle_tools.json: each tool's
 with "x-exec" stripped, and execute() below interprets the call tree.
 """
 
+import ast
+import importlib.util
 import json
 import os
+import re
 import subprocess
+import sys
+import textwrap
+import time
+
+import qwen_agent
 
 try:
     import needle
@@ -22,6 +30,8 @@ except ImportError:
 
 TOOLS_FILE = os.path.join(os.path.dirname(__file__), "needle_tools.json")
 RECORDINGS_DIR = "recordings"
+CHAT_SCRIPTS_DIR = "chat_scripts"
+SCRIPT_TIMEOUT = 300  # seconds before /run gives up on a script
 MAX_ROUNDS = 8
 
 # Needle returns a calibrated 0-1 confidence with each response. Below this
@@ -29,6 +39,12 @@ MAX_ROUNDS = 8
 # first. (Confidence is None for fine-tuned models, in which case we skip the
 # gate.) Override with the NEEDLE_CONFIDENCE_MIN env var.
 CONFIDENCE_MIN = float(os.environ.get("NEEDLE_CONFIDENCE_MIN", "0.5"))
+
+# "auto": Needle first, falling back to Qwen (qwen_agent.py) when Needle errors
+# or is below CONFIDENCE_MIN on its first step.  "needle" / "qwen": one only.
+# Switch at runtime with /model.
+BACKENDS = ("auto", "needle", "qwen")
+BACKEND = os.environ.get("AGENT_BACKEND", "auto")
 
 
 def load_tools(path: str = TOOLS_FILE):
@@ -130,9 +146,13 @@ def execute(spec: dict, args: dict) -> dict:
 # Agent — single prompt turn with tool-execution loop
 # ---------------------------------------------------------------------------
 
-def confirm_low_confidence(response: dict, calls: list) -> bool:
-    """Failsafe: show calls the model isn't confident about and ask to run them."""
-    print(f"\n  [!] Low confidence ({response['confidence']:.0%}) for these tool call(s):")
+class LowConfidence(Exception):
+    pass
+
+
+def confirm_calls(header: str, response: dict, calls: list) -> bool:
+    """Failsafe: show calls we're unsure about and ask the user to run them."""
+    print(f"\n  [!] {header} for these tool call(s):")
     for call in calls:
         print(f"        {fmt_call(call.get('name', ''), call.get('arguments') or {})}")
     if response.get("reasoning"):
@@ -144,8 +164,13 @@ def confirm_low_confidence(response: dict, calls: list) -> bool:
     return ans in ("y", "yes")
 
 
-def run(prompt: str, agent, exec_specs: dict) -> dict:
-    """Send prompt to Needle, execute any tool calls, return the final response."""
+def run(prompt: str, agent, exec_specs: dict, fallback=False, confirm_first=False) -> dict:
+    """Send prompt to the agent, execute any tool calls, return the final response.
+
+    fallback:      raise LowConfidence instead of asking, if the first step is
+                   below CONFIDENCE_MIN (nothing has been executed yet).
+    confirm_first: always ask before executing the first step's calls.
+    """
     response = agent.complete(prompt)
 
     # Small models sometimes get stuck re-emitting the same (already-failed)
@@ -154,16 +179,21 @@ def run(prompt: str, agent, exec_specs: dict) -> dict:
     seen = {}
     results = []
 
-    for _ in range(MAX_ROUNDS):
+    for round_no in range(MAX_ROUNDS):
         calls = response.get("function_calls") or []
         if response.get("type") != "call" or not calls:
             break
 
         conf = response.get("confidence")
-        if conf is not None and conf < CONFIDENCE_MIN and not confirm_low_confidence(response, calls):
-            print("  Skipped.")
-            return {"type": "abort", "reasoning": "Skipped: low confidence, user declined.",
-                    "confidence": conf, "results": []}
+        low = conf is not None and conf < CONFIDENCE_MIN
+        if low and fallback and round_no == 0:
+            raise LowConfidence(conf)
+        if low or (confirm_first and round_no == 0):
+            header = f"Low confidence ({conf:.0%})" if low else "Fallback model proposes"
+            if not confirm_calls(header, response, calls):
+                print("  Skipped.")
+                return {"type": "abort", "reasoning": "Skipped: user declined.",
+                        "confidence": conf, "results": []}
 
         results = []
         all_repeats = True
@@ -192,21 +222,21 @@ def run(prompt: str, agent, exec_specs: dict) -> dict:
 # Slash commands
 # ---------------------------------------------------------------------------
 
-def cmd_help(_ctx):
+def cmd_help(_ctx, _arg):
     print("\nAvailable slash commands:")
     for name, (desc, _) in COMMANDS.items():
         print(f"  {name:<16} {desc}")
     print("\nAnything else is sent to Needle as a natural-language prompt.")
 
 
-def cmd_tools(ctx):
+def cmd_tools(ctx, _arg):
     print(f"\n{ctx['count']} tools loaded from {TOOLS_FILE}:")
     for t in json.loads(ctx["schemas"]):
         fn = t.get("function", t)
         print(f"  {fn['name']:<28} {fn.get('description', '')}")
 
 
-def cmd_recordings(_ctx):
+def cmd_recordings(_ctx, _arg):
     files = list_recordings()
     if not files:
         print(f"No .ldim files found in {RECORDINGS_DIR}/.")
@@ -217,11 +247,253 @@ def cmd_recordings(_ctx):
         print(f"  {f}  ({size_kb} KB)")
 
 
+def cmd_model(ctx, arg):
+    if arg:
+        arg = arg.lower()
+        if arg not in BACKENDS:
+            print(f"Unknown backend '{arg}'. Choose one of: {', '.join(BACKENDS)}")
+            return
+        if arg != "needle" and not ctx["qwen_ok"]:
+            print("Qwen needs mlx-lm: .venv/bin/pip install mlx-lm")
+            return
+        ctx["backend"] = arg
+    print(f"Backend: {ctx['backend']}  (fallback model: {qwen_agent.MODEL_ID})")
+
+
+CHAT_SYSTEM = ("The user is on macOS (Apple Silicon) with Python 3. Any Python script you "
+               "write must run on macOS: no Windows-only modules such as msvcrt, winreg or "
+               "winsound (use curses, or termios/tty, for key presses).")
+
+
+def chat_turn(ctx, text: str):
+    if not ctx["chat_history"]:
+        ctx["chat_history"].append({"role": "system", "content": CHAT_SYSTEM})
+    ctx["chat_history"].append({"role": "user", "content": text})
+    try:
+        reply = qwen_agent.chat(ctx["chat_history"], prefix="Qwen> ")
+    except BaseException:
+        ctx["chat_history"].pop()  # don't keep a turn that never got a reply
+        raise
+    ctx["chat_history"].append({"role": "assistant", "content": reply})
+    offer_save_scripts(ctx, reply)
+
+
+# Any fenced block; the closing fence is optional so a reply cut off mid-script
+# is still caught.  Tag-less blocks count only if they look like Python.
+_CODE_BLOCK = re.compile(r"^[ \t]*```[ \t]*([\w+-]*)[^\n]*\n(.*?)(?:^[ \t]*```|\Z)", re.S | re.M)
+_PY_TAGS = ("python", "python3", "py")
+_PY_HINT = re.compile(r"^\s*(import |from \w+ import |def |class |print\(|if __name__)", re.M)
+
+
+def python_blocks(reply: str) -> list[str]:
+    blocks = []
+    for m in _CODE_BLOCK.finditer(reply):
+        tag, code = m.group(1).lower(), m.group(2)
+        heading = next((l for l in reversed(reply[:m.start()].splitlines()) if l.strip()), "")
+        if "output" in heading.lower():  # "Example output:" fenced as python
+            continue
+        if tag in _PY_TAGS or (not tag and _PY_HINT.search(code)):
+            blocks.append(textwrap.dedent(code))
+    return blocks
+
+
+def next_script_path() -> str:
+    n = 1
+    while os.path.exists(path := os.path.join(CHAT_SCRIPTS_DIR, f"chat_{n}.py")):
+        n += 1
+    return path
+
+
+def parses(code: str) -> bool:
+    try:
+        compile(code, "<chat>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+def script_from_reply(reply: str):
+    """Join every Python block in the reply into one script.
+
+    Models often split a script (imports in one block, the rest in the next),
+    so all blocks are kept, in order.  Blocks that aren't valid Python (e.g.
+    "Example output" fenced as python) are dropped — unless none parse, which
+    happens when the reply was cut off mid-script; then keep everything.
+    Returns (code, n_blocks_used, n_blocks_dropped).
+    """
+    blocks = [b.strip("\n") for b in python_blocks(reply)]
+    blocks = [b for b in blocks if b.strip()]
+    good = [b for b in blocks if parses(b)] or blocks
+    return "\n\n".join(good) + "\n" if good else "", len(good), len(blocks) - len(good)
+
+
+def log_reply(reply: str):
+    """Keep the raw reply so a bad extraction can be compared against it."""
+    os.makedirs(CHAT_SCRIPTS_DIR, exist_ok=True)
+    with open(os.path.join(CHAT_SCRIPTS_DIR, "chat_log.md"), "a") as f:
+        f.write(f"\n\n---- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{reply}\n")
+
+
+def offer_save_scripts(ctx, reply: str):
+    """If the chat reply contains Python code, offer to save it as one script."""
+    code, used, dropped = script_from_reply(reply)
+    if not code:
+        return
+    log_reply(reply)
+    lines = code.splitlines()
+    first = next((l for l in lines if l.strip()), "")
+    print(f"  [save] Python script: {len(lines)} lines from {used} code block(s), "
+          f"starts with: {first.strip()[:60]}")
+    if dropped:
+        print(f"  [save] skipped {dropped} block(s) that aren't valid Python (example output?)")
+    if not parses(code):
+        print("  [save] warning: the script doesn't parse — it may be incomplete.")
+    default = next_script_path()
+    try:
+        ans = input(f"  Save as [{default}]? Enter/y = yes, n = skip, or type a filename: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    if ans.lower() in ("n", "no"):
+        return
+    path = default if ans.lower() in ("", "y", "yes") else ans
+    if not path.endswith(".py"):
+        path += ".py"
+    if os.path.dirname(path) == "":
+        path = os.path.join(CHAT_SCRIPTS_DIR, path)
+    if os.path.exists(path) and not ask_yes(f"  {path} exists. Overwrite? [y/N] "):
+        print("  Skipped.")
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.write(code)
+    print(f"  Saved {path}")
+    ctx["last_script"] = path
+    if ask_yes(f"  Run {path} now? [y/N] "):
+        run_script(path)
+
+
+def ask_yes(question: str) -> bool:
+    try:
+        return input(question).strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+# Import name -> pip package, where they differ.
+PIP_NAMES = {"PIL": "pillow", "cv2": "opencv-python", "sklearn": "scikit-learn",
+             "skimage": "scikit-image", "yaml": "pyyaml", "bs4": "beautifulsoup4",
+             "serial": "pyserial", "dateutil": "python-dateutil",
+             "pygame": "pygame-ce"}  # classic pygame has no Python 3.14 wheels
+
+
+def missing_modules(path: str) -> list[str]:
+    """Top-level imports in the script that this venv can't resolve."""
+    try:
+        with open(path) as f:
+            tree = ast.parse(f.read())
+    except (SyntaxError, OSError):
+        return []  # let the run itself report it
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    here = os.path.dirname(os.path.abspath(path))  # sibling modules the script can import
+    return sorted(n for n in names
+                  if importlib.util.find_spec(n) is None
+                  and not os.path.exists(os.path.join(here, n + ".py"))
+                  and not os.path.isdir(os.path.join(here, n)))
+
+
+def install_missing(path: str) -> bool:
+    """Offer to pip-install a script's missing imports. False = don't run it."""
+    missing = missing_modules(path)
+    if not missing:
+        return True
+    # Standard-library modules that don't exist here (msvcrt, winreg, winsound
+    # are Windows-only) can't come from pip — the script needs rewriting.
+    other_os = [m for m in missing if m in sys.stdlib_module_names]
+    pkgs = [PIP_NAMES.get(m, m) for m in missing if m not in other_os]
+    print(f"  [run] missing module(s): {', '.join(missing)}")
+    if other_os:
+        print(f"  [run] {', '.join(other_os)}: part of Python on another OS (e.g. Windows), "
+              "not installable here.\n        Ask Qwen for a macOS version of the script.")
+    if pkgs:
+        if not ask_yes(f"  pip install {' '.join(pkgs)} into this venv? [y/N] "):
+            return ask_yes("  Run anyway? [y/N] ")
+        res = subprocess.run([sys.executable, "-m", "pip", "install", *pkgs])
+        importlib.invalidate_caches()
+        if res.returncode != 0:
+            print("  [run] pip install failed; see output above.")
+            return ask_yes("  Run anyway? [y/N] ")
+    return not other_os or ask_yes("  Run anyway? [y/N] ")
+
+
+def run_script(path: str):
+    """Run a script with this venv's Python; output goes straight to the terminal."""
+    if not install_missing(path):
+        print("  Not run.")
+        return
+    print(f"  [run] {os.path.basename(sys.executable)} {path}  (Ctrl-C to stop)", flush=True)
+    proc = subprocess.Popen([sys.executable, path])
+    try:
+        code = proc.wait(timeout=SCRIPT_TIMEOUT)
+    except (KeyboardInterrupt, subprocess.TimeoutExpired) as exc:
+        proc.terminate()
+        proc.wait()
+        why = "interrupted" if isinstance(exc, KeyboardInterrupt) else f"timed out after {SCRIPT_TIMEOUT}s"
+        print(f"\n  [run] {why}; stopped.")
+        return
+    print(f"  [run] exit code {code}")
+
+
+def cmd_run(ctx, arg):
+    path = arg or ctx.get("last_script")
+    if not path:
+        print("Usage: /run <script.py>  (defaults to the last script saved from chat)")
+        return
+    if not os.path.exists(path) and os.path.exists(os.path.join(CHAT_SCRIPTS_DIR, path)):
+        path = os.path.join(CHAT_SCRIPTS_DIR, path)
+    if not os.path.exists(path):
+        print(f"{path} not found.")
+        return
+    run_script(path)
+
+
+def cmd_chat(ctx, arg):
+    if not ctx["qwen_ok"]:
+        print("Chat needs mlx-lm: .venv/bin/pip install mlx-lm")
+        return
+    if arg:  # one-off message; history is shared with chat mode
+        chat_turn(ctx, arg)
+        return
+    ctx["chat_mode"] = not ctx["chat_mode"]
+    if ctx["chat_mode"]:
+        print(f"Chat mode on ({qwen_agent.MODEL_ID}, no tools). /chat again to leave.")
+    else:
+        ctx["chat_history"].clear()
+        print("Chat mode off; back to tool agent.")
+
+
+def cmd_qwen(_ctx, arg):
+    if arg:
+        print(f"Qwen model: {qwen_agent.set_model(arg)} (loads on next use)")
+        return
+    print(f"Qwen model: {qwen_agent.MODEL_ID}\nPresets (/qwen <name>, or any MLX repo id):")
+    for name, repo in qwen_agent.PRESETS.items():
+        print(f"  {name:<6} {repo}")
+
+
 COMMANDS = {
     "/help":       ("Show this help message.", cmd_help),
     "/tools":      ("List tools loaded from needle_tools.json.", cmd_tools),
     "/recordings": ("List .ldim files in the local recordings/ folder.", cmd_recordings),
-    "/clear":      ("Clear the terminal screen.", lambda _ctx: os.system("clear")),
+    "/model":      ("Show or set the backend: /model auto|needle|qwen.", cmd_model),
+    "/qwen":       ("Show or switch the Qwen model: /qwen 0.6b|1.7b|4b|8b|14b.", cmd_qwen),
+    "/chat":       ("Toggle plain chat with Qwen (no tools), or /chat <message>.", cmd_chat),
+    "/run":        ("Run a Python script: /run [file] (default: last saved from chat).", cmd_run),
+    "/clear":      ("Clear the terminal screen.", lambda _ctx, _arg: os.system("clear")),
     "/quit":       ("Exit.", None),
 }
 
@@ -249,13 +521,30 @@ def setup_readline():
 # Entry point
 # ---------------------------------------------------------------------------
 
-def ask_needle(prompt: str, ctx: dict):
-    # Fresh Needle instance per prompt so no context bleeds between turns.
-    agent = needle.Needle(tools=ctx["schemas"])
+def run_with(make_agent, prompt: str, ctx: dict, **kw) -> dict:
+    # Fresh agent per prompt so no context bleeds between turns.
+    agent = make_agent(tools=ctx["schemas"])
     try:
-        result = run(prompt, agent, ctx["exec_specs"])
+        return run(prompt, agent, ctx["exec_specs"], **kw)
     finally:
         agent.close()
+
+
+def ask(prompt: str, ctx: dict):
+    backend = ctx["backend"]
+    result = None
+    if backend != "qwen":
+        can_fall_back = backend == "auto" and ctx["qwen_ok"]
+        try:
+            result = run_with(needle.Needle, prompt, ctx, fallback=can_fall_back)
+        except LowConfidence as low:
+            print(f"  [!] Needle low confidence ({low.args[0]:.0%}); trying {qwen_agent.MODEL_ID}...")
+        except Exception as exc:
+            if not can_fall_back:
+                raise
+            print(f"  [!] Needle failed ({exc}); trying {qwen_agent.MODEL_ID}...")
+    if result is None:
+        result = run_with(qwen_agent.QwenAgent, prompt, ctx, confirm_first=backend == "auto")
     print(f"\n[Reason]:  {result.get('reasoning', '')}")
     results = result.get("results") or []
     if results:
@@ -265,24 +554,34 @@ def ask_needle(prompt: str, ctx: dict):
 
 def main():
     schemas, exec_specs, count = load_tools()
-    ctx = {"schemas": schemas, "exec_specs": exec_specs, "count": count}
+    qwen_ok = qwen_agent.available()
+    backend = BACKEND if BACKEND in BACKENDS else "auto"
+    if backend == "qwen" and not qwen_ok:
+        backend = "needle"
+    ctx = {"schemas": schemas, "exec_specs": exec_specs, "count": count,
+           "backend": backend, "qwen_ok": qwen_ok,
+           "chat_mode": False, "chat_history": [], "last_script": None}
     setup_readline()
     print(f"Loading Needle with {count} tools from {os.path.basename(TOOLS_FILE)}...")
+    print(f"Backend: {backend}" + ("" if qwen_ok else "  (Qwen fallback off: mlx-lm not installed)"))
     print("Ready. Type a prompt or /help for commands.")
 
     while True:
         try:
             print()
-            prompt = input("User> ").strip()
+            prompt = input("Chat> " if ctx["chat_mode"] else "User> ").strip()
             if not prompt:
                 continue
-            cmd = prompt.lower().split()[0]
+            cmd, _, arg = prompt.partition(" ")
+            cmd = cmd.lower()
             if cmd == "/quit" or prompt.lower() in ("exit", "quit"):
                 break
             if cmd in COMMANDS:
-                COMMANDS[cmd][1](ctx)
+                COMMANDS[cmd][1](ctx, arg.strip())
+            elif ctx["chat_mode"]:
+                chat_turn(ctx, prompt)
             else:
-                ask_needle(prompt, ctx)
+                ask(prompt, ctx)
         except (KeyboardInterrupt, EOFError):
             break
         except Exception as e:
