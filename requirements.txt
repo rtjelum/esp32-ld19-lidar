@@ -1,0 +1,9 @@
+# Deps for the local agent (run_agent.sh -> needle_agent.py), installed into
+# ./.venv by setupenv.sh.  The .ldim toolchain uses tools/requirements.txt.
+
+# Needle tool-calling model
+cactus-needle
+
+# Qwen / chat backend (Apple Silicon).  >= 0.32 for the spark2_5 architecture
+# (spark-4b) and the qwen3_5 model that the bonsai-27b loader builds on.
+mlx-lm>=0.32

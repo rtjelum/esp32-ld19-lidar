@@ -14,7 +14,9 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+from collections import deque
 
 import qwen_agent
 
@@ -32,6 +34,7 @@ TOOLS_FILE = os.path.join(os.path.dirname(__file__), "needle_tools.json")
 RECORDINGS_DIR = "recordings"
 CHAT_SCRIPTS_DIR = "chat_scripts"
 SCRIPT_TIMEOUT = 300  # seconds before /run gives up on a script
+ERROR_TAIL_LINES = 40  # stderr lines kept from a failed run to send back to the model
 MAX_ROUNDS = 8
 
 # Needle returns a calibrated 0-1 confidence with each response. Below this
@@ -265,7 +268,7 @@ CHAT_SYSTEM = ("The user is on macOS (Apple Silicon) with Python 3. Any Python s
                "winsound (use curses, or termios/tty, for key presses).")
 
 
-def chat_turn(ctx, text: str):
+def chat_turn(ctx, text: str, save_as: str | None = None):
     if not ctx["chat_history"]:
         ctx["chat_history"].append({"role": "system", "content": CHAT_SYSTEM})
     ctx["chat_history"].append({"role": "user", "content": text})
@@ -275,7 +278,7 @@ def chat_turn(ctx, text: str):
         ctx["chat_history"].pop()  # don't keep a turn that never got a reply
         raise
     ctx["chat_history"].append({"role": "assistant", "content": reply})
-    offer_save_scripts(ctx, reply)
+    offer_save_scripts(ctx, reply, save_as)
 
 
 # Any fenced block; the closing fence is optional so a reply cut off mid-script
@@ -283,6 +286,7 @@ def chat_turn(ctx, text: str):
 _CODE_BLOCK = re.compile(r"^[ \t]*```[ \t]*([\w+-]*)[^\n]*\n(.*?)(?:^[ \t]*```|\Z)", re.S | re.M)
 _PY_TAGS = ("python", "python3", "py")
 _PY_HINT = re.compile(r"^\s*(import |from \w+ import |def |class |print\(|if __name__)", re.M)
+_MAIN_GUARD = re.compile(r"^if __name__\s*==\s*['\"]__main__['\"]\s*:", re.M)
 
 
 def python_blocks(reply: str) -> list[str]:
@@ -319,11 +323,17 @@ def script_from_reply(reply: str):
     so all blocks are kept, in order.  Blocks that aren't valid Python (e.g.
     "Example output" fenced as python) are dropped — unless none parse, which
     happens when the reply was cut off mid-script; then keep everything.
+    If a block is a complete program (has a __main__ guard), it is used on its
+    own: the other blocks are then "optional tweak" snippets that would break
+    it if appended after the guard.
     Returns (code, n_blocks_used, n_blocks_dropped).
     """
     blocks = [b.strip("\n") for b in python_blocks(reply)]
     blocks = [b for b in blocks if b.strip()]
     good = [b for b in blocks if parses(b)] or blocks
+    complete = [b for b in good if _MAIN_GUARD.search(b)]
+    if complete:
+        good = [max(complete, key=len)]
     return "\n\n".join(good) + "\n" if good else "", len(good), len(blocks) - len(good)
 
 
@@ -334,8 +344,11 @@ def log_reply(reply: str):
         f.write(f"\n\n---- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{reply}\n")
 
 
-def offer_save_scripts(ctx, reply: str):
-    """If the chat reply contains Python code, offer to save it as one script."""
+def offer_save_scripts(ctx, reply: str, default: str | None = None):
+    """If the chat reply contains Python code, offer to save it as one script.
+
+    default: suggested path (a fix for a failed script overwrites that script).
+    """
     code, used, dropped = script_from_reply(reply)
     if not code:
         return
@@ -345,10 +358,11 @@ def offer_save_scripts(ctx, reply: str):
     print(f"  [save] Python script: {len(lines)} lines from {used} code block(s), "
           f"starts with: {first.strip()[:60]}")
     if dropped:
-        print(f"  [save] skipped {dropped} block(s) that aren't valid Python (example output?)")
+        print(f"  [save] skipped {dropped} other block(s) (optional snippets or example output)")
     if not parses(code):
         print("  [save] warning: the script doesn't parse — it may be incomplete.")
-    default = next_script_path()
+    fixing = default is not None
+    default = default or next_script_path()
     try:
         ans = input(f"  Save as [{default}]? Enter/y = yes, n = skip, or type a filename: ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -360,7 +374,7 @@ def offer_save_scripts(ctx, reply: str):
         path += ".py"
     if os.path.dirname(path) == "":
         path = os.path.join(CHAT_SCRIPTS_DIR, path)
-    if os.path.exists(path) and not ask_yes(f"  {path} exists. Overwrite? [y/N] "):
+    if os.path.exists(path) and not (fixing and path == default) and not ask_yes(f"  {path} exists. Overwrite? [y/N] "):
         print("  Skipped.")
         return
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -369,7 +383,7 @@ def offer_save_scripts(ctx, reply: str):
     print(f"  Saved {path}")
     ctx["last_script"] = path
     if ask_yes(f"  Run {path} now? [y/N] "):
-        run_script(path)
+        run_and_fix(ctx, path)
 
 
 def ask_yes(question: str) -> bool:
@@ -431,12 +445,27 @@ def install_missing(path: str) -> bool:
 
 
 def run_script(path: str):
-    """Run a script with this venv's Python; output goes straight to the terminal."""
+    """Run a script with this venv's Python; output goes straight to the terminal.
+
+    stderr is also teed into a buffer so a traceback can be sent back to the
+    model.  Returns (exit_code, stderr_tail); exit_code is None if the script
+    wasn't run or was stopped (Ctrl-C / timeout).
+    """
     if not install_missing(path):
         print("  Not run.")
-        return
+        return None, ""
     print(f"  [run] {os.path.basename(sys.executable)} {path}  (Ctrl-C to stop)", flush=True)
-    proc = subprocess.Popen([sys.executable, path])
+    proc = subprocess.Popen([sys.executable, path], stderr=subprocess.PIPE, text=True)
+    tail = deque(maxlen=ERROR_TAIL_LINES)
+
+    def tee():
+        for line in proc.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            tail.append(line)
+
+    reader = threading.Thread(target=tee, daemon=True)
+    reader.start()
     try:
         code = proc.wait(timeout=SCRIPT_TIMEOUT)
     except (KeyboardInterrupt, subprocess.TimeoutExpired) as exc:
@@ -444,8 +473,31 @@ def run_script(path: str):
         proc.wait()
         why = "interrupted" if isinstance(exc, KeyboardInterrupt) else f"timed out after {SCRIPT_TIMEOUT}s"
         print(f"\n  [run] {why}; stopped.")
-        return
+        return None, ""
+    reader.join(timeout=2)
     print(f"  [run] exit code {code}")
+    return code, "".join(tail)
+
+
+def run_and_fix(ctx, path: str):
+    """Run a script; if it fails, offer to send the error to the model for a fix.
+
+    The fixed script is offered under the same path, and its "Run now?" comes
+    back here, so fix -> run -> fix repeats for as long as the user says yes.
+    """
+    code, err = run_script(path)
+    if not code or not ctx["qwen_ok"]:
+        return
+    if not ask_yes(f"  Send the error to {qwen_agent.MODEL_ID} to fix? [y/N] "):
+        return
+    with open(path) as f:
+        source = f.read()
+    chat_turn(ctx, (
+        f"I ran `{os.path.basename(path)}` and it failed with exit code {code}.\n\n"
+        f"Script:\n```python\n{source}```\n\n"
+        f"Error output (last {ERROR_TAIL_LINES} lines of stderr):\n```\n{err.strip() or '(none)'}\n```\n\n"
+        "Explain the cause briefly, then reply with the complete corrected script "
+        "in a single ```python block."), save_as=path)
 
 
 def cmd_run(ctx, arg):
@@ -458,7 +510,7 @@ def cmd_run(ctx, arg):
     if not os.path.exists(path):
         print(f"{path} not found.")
         return
-    run_script(path)
+    run_and_fix(ctx, path)
 
 
 def cmd_chat(ctx, arg):
@@ -490,7 +542,7 @@ COMMANDS = {
     "/tools":      ("List tools loaded from needle_tools.json.", cmd_tools),
     "/recordings": ("List .ldim files in the local recordings/ folder.", cmd_recordings),
     "/model":      ("Show or set the backend: /model auto|needle|qwen.", cmd_model),
-    "/qwen":       ("Show or switch the Qwen model: /qwen 0.6b|1.7b|4b|8b|14b.", cmd_qwen),
+    "/qwen":       ("Show or switch the Qwen model: /qwen 0.6b|1.7b|4b|8b|14b|minicpm5-2b|spark-4b|bonsai-27b.", cmd_qwen),
     "/chat":       ("Toggle plain chat with Qwen (no tools), or /chat <message>.", cmd_chat),
     "/run":        ("Run a Python script: /run [file] (default: last saved from chat).", cmd_run),
     "/clear":      ("Clear the terminal screen.", lambda _ctx, _arg: os.system("clear")),
